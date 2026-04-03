@@ -83,6 +83,36 @@ ln -s "$(pwd)/adversarial-review" ~/.agents/skills/adversarial-review
 
 After symlinking, the skill is available as `/adversarial-review` in Claude Code.
 
+### Recommended permissions
+
+The skill runs git, codex, and `/tmp` write commands that will trigger
+permission prompts. To avoid repeated confirmations, add these to your
+`.claude/settings.local.json`:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(git diff*)",
+      "Bash(git status*)",
+      "Bash(git symbolic-ref*)",
+      "Bash(git rev-parse*)",
+      "Bash(timeout 600 codex exec *)",
+      "Bash(rm -f /tmp/claude-plan-*)",
+      "Bash(rm -f /tmp/codex-review-*)",
+      "Write(/tmp/claude-plan-*)",
+      "Write(/tmp/codex-review-*)"
+    ]
+  }
+}
+```
+
+**Note:** The `codex exec` rule allows any `codex exec` invocation wrapped
+in `timeout 600`. The skill only uses read-only mode (`-s read-only`), but
+Claude Code's permission patterns are prefix-based and cannot enforce flag
+constraints. If you prefer tighter control, omit the `codex exec` rule and
+approve each review invocation manually.
+
 ## Usage
 
 ```

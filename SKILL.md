@@ -1,113 +1,113 @@
 ---
 name: adversarial-review
-description: Adversarial AI code/plan review. Codex ревьюит, Claude правит, итеративный цикл до одобрения. Автодетект режима plan/code/code-vs-plan.
+description: Adversarial AI code/plan review. Codex reviews, Claude fixes, iterative loop until approved. Auto-detects plan/code/code-vs-plan mode.
 user_invocable: true
 ---
 
 # Adversarial Code Review
 
-Отправляет текущую работу на adversarial-ревью через внешнюю AI-модель (по умолчанию — OpenAI Codex). Автоматически определяет, что ревьюить: **план** или **код**. Claude правит по замечаниям ревьюера и переотправляет до одобрения. Максимум 5 раундов.
+Sends current work for adversarial review through an external AI model (OpenAI Codex by default). Auto-detects what to review: **plan** or **code**. Claude fixes issues based on reviewer feedback and resubmits until approved. Maximum 5 rounds.
 
 ---
 
-## Когда вызывать
+## When to invoke
 
-- `/adversarial-review` — автодетект что ревьюить
-- `/adversarial-review plan` — принудительно ревью плана
-- `/adversarial-review code` — принудительно ревью кода
-- `/adversarial-review <путь-к-файлу>` — ревью конкретного файла (аргумент содержит `/` или `.`)
-- Переопределение reasoning: `/adversarial-review xhigh` или `/adversarial-review low` (одно из: `none`, `low`, `medium`, `high`, `xhigh`)
-- Переопределение модели: `/adversarial-review model:gpt-5.3-codex` (аргумент с префиксом `model:`)
+- `/adversarial-review` — auto-detect what to review
+- `/adversarial-review plan` — force plan review
+- `/adversarial-review code` — force code review
+- `/adversarial-review <file-path>` — review a specific file (argument contains `/` or `.`)
+- Override reasoning: `/adversarial-review xhigh` or `/adversarial-review low` (one of: `none`, `low`, `medium`, `high`, `xhigh`)
+- Override model: `/adversarial-review model:gpt-5.3-codex` (argument with `model:` prefix)
 
-## Инструкции
+## Instructions
 
-> **Плейсхолдеры:** `${REVIEW_ID}`, `${CODEX_SESSION_ID}` и `${BASE_BRANCH}` в шагах ниже — это шаблонные плейсхолдеры, НЕ shell-переменные. Подставляй литеральные значения напрямую в каждый tool call.
+> **Placeholders:** `${REVIEW_ID}`, `${CODEX_SESSION_ID}` and `${BASE_BRANCH}` in the steps below are template placeholders, NOT shell variables. Substitute literal values directly into each tool call.
 
-### Шаг 1: Определить режим ревью
+### Step 1: Determine review mode
 
-Определи, что ревьюить. Проверяй в порядке приоритета:
+Determine what to review. Check in priority order:
 
-**1. Явный аргумент** (`plan`, `code`, путь к файлу) → использовать его.
-   - Для `plan` → пропустить все git-проверки, перейти к шагу 2 (только REVIEW_ID).
+**1. Explicit argument** (`plan`, `code`, file path) → use it.
+   - For `plan` → skip all git checks, proceed to step 2 (REVIEW_ID only).
 
-**2. Claude Code Plan Mode** — если в контексте есть системное сообщение "Plan mode is active" → режим = `plan`, пропустить git. В Plan Mode код не редактируется, поэтому code/code-vs-plan невозможны.
+**2. Claude Code Plan Mode** — if context contains the system message "Plan mode is active" → mode = `plan`, skip git. In Plan Mode code is not edited, so code/code-vs-plan are impossible.
 
-**3. Автодетект** (без явного аргумента, вне Plan Mode):
+**3. Auto-detect** (no explicit argument, not in Plan Mode):
 
-1. Проверь наличие изменений кода (любой непустой — значит есть):
+1. Check for code changes (any non-empty output means changes exist):
    - `git diff --name-only` — unstaged
    - `git diff --cached --name-only` — staged
-   - `git diff --name-only ${BASE_BRANCH}...HEAD` — коммиты ветки
-2. Проверь, есть ли план в текущем контексте разговора (из plan mode, задач или обсуждения).
+   - `git diff --name-only ${BASE_BRANCH}...HEAD` — branch commits
+2. Check if a plan exists in the current conversation context (from plan mode, tasks, or discussion).
 
-| Изменения кода? | План в контексте? | Режим |
-|----------------|-------------------|-------|
-| Нет | Да | **plan** — ревью плана |
-| Да | Да | **code-vs-plan** — ревью реализации против плана |
-| Да | Нет | **code** — ревью изменений кода |
-| Нет | Нет | Спросить пользователя, что ревьюить |
+| Code changes? | Plan in context? | Mode |
+|--------------|-----------------|------|
+| No | Yes | **plan** — review the plan |
+| Yes | Yes | **code-vs-plan** — review implementation against plan |
+| Yes | No | **code** — review code changes |
+| No | No | Ask the user what to review |
 
-### Шаг 2: Сгенерировать Session ID и определить base branch
+### Step 2: Generate Session ID and determine base branch
 
-Сгенерируй уникальный `REVIEW_ID` самостоятельно, формат: `{unix_timestamp}-{случайное_4значное_число}`.
-Пример: `1711872000-4821`. **НЕ используй bash** — подставляй значение напрямую в команды следующих шагов.
+Generate a unique `REVIEW_ID` yourself, format: `{unix_timestamp}-{random_4digit_number}`.
+Example: `1711872000-4821`. **Do NOT use bash** — substitute the value directly into commands in the following steps.
 
-**Определение base branch (только для режимов `code` и `code-vs-plan`):**
+**Determining base branch (only for `code` and `code-vs-plan` modes):**
 
-Для режима `plan` — пропустить определение base branch, перейти к шагу 3.
+For `plan` mode — skip base branch detection, proceed to step 3.
 
-Для остальных режимов определи base branch репозитория:
+For other modes, determine the repository's base branch:
 
 ```bash
 git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||'
 ```
 
-Если команда вернула пустой результат (remote HEAD не настроен), используй fallback:
+If the command returns empty (remote HEAD not configured), use fallback:
 
 ```bash
 git rev-parse --verify main 2>/dev/null && echo main || echo master
 ```
 
-Сохрани результат как `BASE_BRANCH` — используется в `git diff ${BASE_BRANCH}...HEAD` далее.
+Save the result as `BASE_BRANCH` — used in `git diff ${BASE_BRANCH}...HEAD` below.
 
-### Шаг 3: Подготовить материал для ревью
+### Step 3: Prepare review material
 
-**Ревью плана:**
+**Plan review:**
 
-- Если план уже существует как файл (в `project/`, plan file от Plan Mode, memory или где-то в репо) — использовать путь напрямую. НЕ копировать. В Claude Code Plan Mode план всегда является файлом.
-- Если план только в контексте разговора (вне Plan Mode) — записать через **Write tool** в `/tmp/claude-plan-${REVIEW_ID}.md`.
-- **Обязательно вывести путь к файлу плана пользователю**, чтобы он мог открыть его в IDE:
-  `📄 План для ревью: <путь-к-файлу>`
+- If the plan already exists as a file (in `project/`, plan file from Plan Mode, memory, or somewhere in the repo) — use the path directly. Do NOT copy. In Claude Code Plan Mode the plan is always a file.
+- If the plan is only in the conversation context (outside Plan Mode) — write via **Write tool** to `/tmp/claude-plan-${REVIEW_ID}.md`.
+- **Always print the plan file path for the user** so they can open it in their IDE:
+  `Plan for review: <file-path>`
 
-**Ревью кода:**
+**Code review:**
 
-Собери список изменённых файлов:
+Collect the list of changed files:
 
 1. `git diff --name-only` — unstaged changes
 2. `git diff --cached --name-only` — staged changes
 
-Объедини unstaged + staged (уникальные пути). Если оба пусты:
+Merge unstaged + staged (unique paths). If both are empty:
 
-3. `git diff --name-only ${BASE_BRANCH}...HEAD` — коммиты ветки (fallback)
+3. `git diff --name-only ${BASE_BRANCH}...HEAD` — branch commits (fallback)
 
-Branch берётся ТОЛЬКО когда нет локальных изменений — иначе контекст раздувается.
-Для branch в промпте указывай команду `git diff ${BASE_BRANCH}...HEAD` (полный diff).
+Branch diff is used ONLY when there are no local changes — otherwise context bloats.
+For branch diff, include the command `git diff ${BASE_BRANCH}...HEAD` (full diff) in the prompt.
 
-Ревьюер имеет доступ к репо и сам прочитает полный diff и файлы.
-В промпт (шаг 4) передай список файлов и какие git diff команды запускать.
+The reviewer has access to the repo and will read full diffs and files on its own.
+In the prompt (step 4), pass the file list and which git diff commands to run.
 
-**Много файлов (> 50):** если объединённый список превышает 50 путей,
-передай в промпт только git-команды без списка файлов — ревьюер разберётся сам.
+**Many files (> 50):** if the combined list exceeds 50 paths,
+pass only git commands without the file list — the reviewer will figure it out.
 
-Если все источники пусты — нет изменений для ревью, сообщи пользователю.
+If all sources are empty — no changes to review, inform the user.
 
-**Ревью кода против плана:** подготовить путь к плану И собрать список изменённых файлов (как выше).
+**Code-vs-plan review:** prepare the plan path AND collect the list of changed files (as above).
 
-### Шаг 4: Сформировать промпт и запустить первый раунд
+### Step 4: Build the prompt and launch the first round
 
-Сформируй промпт в зависимости от режима. Все промпты используют adversarial stance.
+Build the prompt depending on the mode. All prompts use the adversarial stance.
 
-**Промпт для ревью плана:**
+**Prompt for plan review:**
 
 ```
 <role>
@@ -154,12 +154,12 @@ If the plan is solid, say so clearly — false positives erode trust.
 </calibration>
 
 <output_format>
-## Summary
-One paragraph: what this plan does and your overall assessment.
+Use markdown headers for sections: Summary, Findings, Verdict.
 
-## Findings
-For each finding:
-### [severity: critical|high|medium] Finding title
+Summary: one paragraph — what this plan does and your overall assessment.
+
+Findings: for each finding, use a sub-header with [severity: critical|high|medium] and title.
+Include these fields per finding:
 - **Section:** which part of the plan
 - **What can go wrong:** ...
 - **Why vulnerable:** ...
@@ -168,15 +168,14 @@ For each finding:
 
 If no findings: "No actionable findings."
 
-## Verdict
-Rules: approve if no findings or all low severity; revise if any high/critical.
+Verdict rules: approve if no findings or all low severity; revise if any high/critical.
 Choose exactly one. The LAST line of your response must be one of:
 VERDICT: APPROVED
 VERDICT: REVISE
 </output_format>
 ```
 
-**Промпт для ревью кода (<= 50 файлов):**
+**Prompt for code review (<= 50 files):**
 
 ```
 <role>
@@ -194,7 +193,7 @@ If something only works on the happy path, treat that as a real weakness.
 <task>
 Review the code changes in this repo. Changed files:
 
-<список файлов из --name-only>
+<file list from --name-only>
 
 Changes include: <unstaged changes / staged changes / unstaged + staged changes / branch changes vs ${BASE_BRANCH}>.
 Run <git diff commands> to see the full diffs.
@@ -232,12 +231,12 @@ If the change is solid, say so clearly — false positives erode trust.
 </calibration>
 
 <output_format>
-## Summary
-One paragraph: what this change does and your overall assessment.
+Use markdown headers for sections: Summary, Findings, Verdict.
 
-## Findings
-For each finding:
-### [severity: critical|high|medium] Finding title
+Summary: one paragraph — what this change does and your overall assessment.
+
+Findings: for each finding, use a sub-header with [severity: critical|high|medium] and title.
+Include these fields per finding:
 - **File:** path/to/file.ext lines N-M
 - **What can go wrong:** ...
 - **Why vulnerable:** ...
@@ -246,17 +245,16 @@ For each finding:
 
 If no findings: "No actionable findings."
 
-## Verdict
-Rules: approve if no findings or all low severity; revise if any high/critical.
+Verdict rules: approve if no findings or all low severity; revise if any high/critical.
 Choose exactly one. The LAST line of your response must be one of:
 VERDICT: APPROVED
 VERDICT: REVISE
 </output_format>
 ```
 
-**Промпт для ревью кода (> 50 файлов):**
+**Prompt for code review (> 50 files):**
 
-Тот же промпт, что выше, но секция `<task>` без списка файлов:
+Same prompt as above, but the `<task>` section without the file list:
 ```
 <task>
 Review the code changes in this repo.
@@ -265,35 +263,35 @@ Run <git diff commands> to see changed files and full diffs.
 </task>
 ```
 
-**Промпт для ревью кода против плана:**
+**Prompt for code-vs-plan review:**
 
-Тот же промпт для ревью кода, но секция `<task>` дополняется:
+Same prompt as code review, but the `<task>` section is extended:
 ```
 <task>
 Review the code changes in this repo against the implementation plan in <plan-path>.
 Changed files:
 
-<список файлов или пусто если > 50>
+<file list or empty if > 50>
 
-Changes include: <тип>.
+Changes include: <type>.
 Run <git diff commands> to see the full diffs.
 </task>
 ```
 
-И в `<attack_surface>` добавляются пункты:
+And the following items are added to `<attack_surface>`:
 ```
 - Completeness: does the implementation cover all plan steps?
 - Deviations: where does the code differ from the plan? Are deviations justified?
 - Missing: what from the plan is not yet implemented?
 ```
 
-**Запуск Codex — шаблон команды:**
+**Launching Codex — command template:**
 
-Флаги:
-- `-m gpt-5.4` — модель (переопределяется аргументом `model:...`)
-- `-c model_reasoning_effort=high` — глубина рассуждения (переопределяется аргументом `xhigh`, `low` и т.д.)
-- `-s read-only` — ревьюер только читает, не пишет
-- `-o /tmp/codex-review-${REVIEW_ID}.md` — файл для записи ответа
+Flags:
+- `-m gpt-5.4` — model (overridden by `model:...` argument)
+- `-c model_reasoning_effort=high` — reasoning depth (overridden by `xhigh`, `low`, etc.)
+- `-s read-only` — reviewer only reads, does not write
+- `-o /tmp/codex-review-${REVIEW_ID}.md` — file for capturing output
 
 ```bash
 timeout 600 codex exec \
@@ -301,71 +299,71 @@ timeout 600 codex exec \
   -c model_reasoning_effort=high \
   -s read-only \
   -o /tmp/codex-review-${REVIEW_ID}.md \
-  "ПРОМПТ"
+  "PROMPT"
 ```
 
-**Важно:**
-- Всегда оборачивай `codex exec` в `timeout 600` (10 минут). Если Codex зависнет — команда завершится с кодом 124.
-- Используй параметр `timeout: 620000` в Bash tool для запаса.
-- Команда **синхронная**: когда она вернулась, файл `-o` уже готов. **НЕ** используй poll-loop (`while/sleep`).
-- Если exit code = 124 (таймаут) — сообщи пользователю и предложи повторить.
+**Important:**
+- Always wrap `codex exec` in `timeout 600` (10 minutes). If Codex hangs — the command exits with code 124.
+- Use `timeout: 620000` parameter in Bash tool for headroom.
+- The command is **synchronous**: when it returns, the `-o` file is ready. Do **NOT** use a poll-loop (`while/sleep`).
+- If exit code = 124 (timeout) — inform the user and offer to retry.
 
-**После запуска:** найди в выводе строку `session id: <uuid>` и сохрани значение как `CODEX_SESSION_ID` — оно нужно для `resume` в последующих раундах.
+**After launch:** find the `session id: <uuid>` line in the output and save the value as `CODEX_SESSION_ID` — needed for `resume` in subsequent rounds.
 
-**Примечания:**
-- Модель по умолчанию: `gpt-5.4` с `model_reasoning_effort=high`. Пользователь может переопределить через аргументы.
-- Всегда `-s read-only` — ревьюер не должен писать файлы.
-- `-o` для захвата вывода в файл. **НЕ** запускай в background — команда сама вернёт управление.
+**Notes:**
+- Default model: `gpt-5.4` with `model_reasoning_effort=high`. User can override via arguments.
+- Always `-s read-only` — reviewer must not write files.
+- `-o` captures output to file. Do **NOT** run in background — the command returns control on its own.
 
-### Шаг 5: Прочитать ревью и проверить вердикт
+### Step 5: Read the review and check the verdict
 
-1. Прочитать `/tmp/codex-review-${REVIEW_ID}.md`
-2. Показать пользователю **дословно** (verbatim) — не перефразировать findings ревьюера:
-
-```
-## Adversarial Review — Раунд N (режим: <plan|code|code-vs-plan>, модель: gpt-5.4)
-
-[Отзыв ревьюера — дословно]
-```
-
-3. Проверить вердикт:
-   - **VERDICT: APPROVED** → перейти к Шагу 8 (Готово)
-   - **VERDICT: REVISE** → перейти к Шагу 6 (Правки)
-   - Нет явного вердикта → считать parse failure, запустить resume/fallback с просьбой дать чёткий вердикт
-   - Достигнут максимум (5 раундов) → перейти к Шагу 8 с пометкой
-
-### Шаг 6: Внести правки
-
-По замечаниям ревьюера:
-
-**Для ревью плана:** исправить план — адресовать каждое замечание. Обновить файл плана (или temp-файл). Показать пользователю:
+1. Read `/tmp/codex-review-${REVIEW_ID}.md`
+2. Show the user **verbatim** — do not rephrase the reviewer's findings:
 
 ```
-### Правки (Раунд N)
-- [Что изменено и почему, один пункт на замечание]
+## Adversarial Review — Round N (mode: <plan|code|code-vs-plan>, model: gpt-5.4)
+
+[Reviewer's response — verbatim]
 ```
 
-**Для ревью кода:** исправить код напрямую — редактировать файлы, запустить тесты если применимо. Показать пользователю:
+3. Check the verdict:
+   - **VERDICT: APPROVED** → proceed to Step 8 (Done)
+   - **VERDICT: REVISE** → proceed to Step 6 (Fixes)
+   - No clear verdict → treat as parse failure, run resume/fallback requesting a clear verdict
+   - Maximum reached (5 rounds) → proceed to Step 8 with a note
+
+### Step 6: Apply fixes
+
+Based on the reviewer's findings:
+
+**For plan review:** fix the plan — address each finding. Update the plan file (or temp file). Show the user:
 
 ```
-### Исправления (Раунд N)
-- [Что исправлено и почему, один пункт на замечание]
+### Fixes (Round N)
+- [What was changed and why, one item per finding]
 ```
 
-**Пропустить** правку, если она противоречит явным требованиям пользователя — отметить это для пользователя.
+**For code review:** fix the code directly — edit files, run tests if applicable. Show the user:
 
-### Шаг 7: Переотправить в Codex (Раунды 2-5)
+```
+### Fixes (Round N)
+- [What was fixed and why, one item per finding]
+```
 
-**Resume — основной путь.** Экономит токены и сохраняет контекст сессии. Свежий `codex exec` без resume — **аварийный fallback**, расходует значительно больше токенов. Использовать только при ошибке resume.
+**Skip** a fix if it contradicts the user's explicit requirements — note this for the user.
 
-1. Запусти resume с подавлением stderr (`2>/dev/null`):
+### Step 7: Resubmit to Codex (Rounds 2-5)
+
+**Resume is the primary path.** Saves tokens and preserves session context. A fresh `codex exec` without resume is an **emergency fallback** that costs significantly more tokens. Use only if resume fails.
+
+1. Run resume with stderr suppressed (`2>/dev/null`):
 
 ```bash
 timeout 600 codex exec resume ${CODEX_SESSION_ID} \
   "I've revised based on your feedback.
 
 Here's what I changed:
-[Список правок]
+[List of fixes]
 
 Re-review with the same adversarial stance. Focus on:
 1. Whether my fixes actually resolve the reported issues
@@ -374,74 +372,74 @@ Re-review with the same adversarial stance. Focus on:
 End with VERDICT: APPROVED or VERDICT: REVISE" 2>/dev/null
 ```
 
-Используй `timeout: 620000` в параметрах Bash tool.
+Use `timeout: 620000` in Bash tool parameters.
 
-**Почему `2>/dev/null`:** `codex exec` по дизайну разделяет потоки — progress/metadata → stderr, финальный ответ модели → stdout. Подавление stderr даёт чистый вывод без CLI-шума. Результат Bash tool = только ревью.
+**Why `2>/dev/null`:** `codex exec` by design separates streams — progress/metadata → stderr, final model response → stdout. Suppressing stderr gives clean output without CLI noise. The Bash tool result = review only.
 
-2. Проверь результат по exit code:
-   - **exit 0** — успех. stdout содержит чистое ревью. Показать пользователю напрямую (Write в файл и Read **не нужны**). Проверить VERDICT: последняя непустая строка stdout = `VERDICT: APPROVED` или `VERDICT: REVISE`. Если вердикт отсутствует → вывод мог быть обрезан, перейти к Fallback. Далее применить обработку вердикта из Шага 5 (APPROVED → Шаг 8, REVISE → Шаг 6).
-   - **exit 124** — таймаут. Сообщи пользователю: "Ревьюер не ответил за 10 минут" и предложи повторить.
-   - **другой exit code** — сообщи пользователю: "Resume не удался (exit code N)". Перейди к Fallback. Диагностика без stderr недоступна — не пытайся парсить stdout как ошибку.
+2. Check the result by exit code:
+   - **exit 0** — success. stdout contains clean review. Show to user directly (Write to file and Read are **not needed**). Check VERDICT: the last non-empty line of stdout = `VERDICT: APPROVED` or `VERDICT: REVISE`. If verdict is missing → output may have been truncated, proceed to Fallback. Then apply verdict handling from Step 5 (APPROVED → Step 8, REVISE → Step 6).
+   - **exit 124** — timeout. Tell the user: "Reviewer did not respond within 10 minutes" and offer to retry.
+   - **other exit code** — tell the user: "Resume failed (exit code N)". Proceed to Fallback. Diagnostics without stderr are unavailable — do not try to parse stdout as an error.
 
-**Fallback** — если `resume` не сработал (сессия истекла, session ID не захвачен, ошибка):
+**Fallback** — if `resume` did not work (session expired, session ID not captured, error):
 
-1. Собрать список изменённых файлов (аналогично Шагу 3).
-2. Запустить свежий `codex exec -o` с описанием предыдущих раундов в промпте.
+1. Collect the list of changed files (same as Step 3).
+2. Launch a fresh `codex exec -o` with a description of previous rounds in the prompt.
 
-Вернуться к **Шагу 5**.
+Return to **Step 5**.
 
-### Шаг 8: Итоговый результат
+### Step 8: Final result
 
-**Одобрено:**
+**Approved:**
 ```
-## Adversarial Review — Итог (режим: <режим>, модель: gpt-5.4)
+## Adversarial Review — Summary (mode: <mode>, model: gpt-5.4)
 
-**Статус:** ✅ Одобрено после N раунд(ов)
+**Status:** Approved after N round(s)
 
-[Итоговый отзыв]
+[Final review]
 
 ---
-**Проверено и одобрено ревьюером. Ожидает вашего решения.**
+**Reviewed and approved by the reviewer. Awaiting your decision.**
 ```
 
-**Достигнут максимум раундов:**
+**Maximum rounds reached:**
 ```
-## Adversarial Review — Итог (режим: <режим>, модель: gpt-5.4)
+## Adversarial Review — Summary (mode: <mode>, model: gpt-5.4)
 
-**Статус:** ⚠️ Достигнут максимум (5 раундов) — не полностью одобрено
+**Status:** Maximum reached (5 rounds) — not fully approved
 
-**Оставшиеся замечания:**
-[Нерешённые вопросы]
+**Remaining findings:**
+[Unresolved issues]
 
 ---
-**У ревьюера остались замечания. Просмотрите их и решите, как действовать дальше.**
+**The reviewer still has findings. Please review them and decide how to proceed.**
 ```
 
-### Шаг 9: Очистка
+### Step 9: Cleanup
 
-**В Claude Code Plan Mode:** пропустить любой cleanup (включая deferred). rm вызовет permission prompt. Файлы подчистятся при следующем вызове вне Plan Mode.
+**In Claude Code Plan Mode:** skip all cleanup (including deferred). rm will trigger a permission prompt. Files will be cleaned up on the next invocation outside Plan Mode.
 
-**Вне Plan Mode:**
+**Outside Plan Mode:**
 
 ```bash
 rm -f /tmp/claude-plan-${REVIEW_ID}.md /tmp/codex-review-${REVIEW_ID}.md
 ```
 
-Если пользователь отклонил rm — продолжить без ошибки.
+If the user declined rm — continue without error.
 
-НЕ удалять файлы планов, которые существовали до ревью (только temp-файлы, созданные этим скиллом). Старые temp-файлы от предыдущих сессий безвредны в /tmp и очистятся ОС при перезагрузке.
+Do NOT delete plan files that existed before the review (only temp files created by this skill). Old temp files from previous sessions are harmless in /tmp and will be cleaned up by the OS on reboot.
 
-## Правила
+## Rules
 
-- Claude **активно правит** по замечаниям ревьюера — это НЕ просто передача сообщений
-- Findings ревьюера показываются **дословно** (verbatim) — не перефразировать, не сокращать
-- Автодетект режима ревью по контексту; аргументы пользователя имеют приоритет
-- При явном аргументе `plan` или в Claude Code Plan Mode: пропускать git-проверки и определение base branch
-- Resume — основной путь для повторных раундов. Свежий exec — аварийный fallback (дорогой по токенам)
-- Cleanup — best-effort: в Plan Mode пропускать, при отказе продолжать без ошибки
-- Предпочитать существующие файлы, не создавать лишние копии
-- Всегда read-only sandbox — ревьюер никогда не пишет файлы
-- Максимум 5 раундов для защиты от бесконечных циклов
-- Показывать пользователю отзывы и правки каждого раунда
-- Если Codex CLI не установлен или упал — сообщить пользователю: `npm install -g @openai/codex`
-- Если правка противоречит явным требованиям пользователя — пропустить и объяснить почему
+- Claude **actively fixes** issues based on reviewer feedback — this is NOT just message forwarding
+- Reviewer findings are shown **verbatim** — do not rephrase or shorten
+- Auto-detect review mode from context; user arguments take priority
+- With explicit `plan` argument or in Claude Code Plan Mode: skip git checks and base branch detection
+- Resume is the primary path for subsequent rounds. Fresh exec is an emergency fallback (expensive in tokens)
+- Cleanup is best-effort: skip in Plan Mode, continue without error if declined
+- Prefer existing files, do not create unnecessary copies
+- Always read-only sandbox — reviewer never writes files
+- Maximum 5 rounds to protect against infinite loops
+- Show the user reviews and fixes for each round
+- If Codex CLI is not installed or crashed — tell the user: `npm install -g @openai/codex`
+- If a fix contradicts the user's explicit requirements — skip and explain why
