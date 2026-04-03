@@ -169,8 +169,10 @@ For each finding:
 If no findings: "No actionable findings."
 
 ## Verdict
-VERDICT: APPROVED — no findings, or all findings are low severity
-VERDICT: REVISE — one or more high/critical findings
+Rules: approve if no findings or all low severity; revise if any high/critical.
+Choose exactly one. The LAST line of your response must be one of:
+VERDICT: APPROVED
+VERDICT: REVISE
 </output_format>
 ```
 
@@ -245,8 +247,10 @@ For each finding:
 If no findings: "No actionable findings."
 
 ## Verdict
-VERDICT: APPROVED — no findings, or all findings are low severity
-VERDICT: REVISE — one or more high/critical findings
+Rules: approve if no findings or all low severity; revise if any high/critical.
+Choose exactly one. The LAST line of your response must be one of:
+VERDICT: APPROVED
+VERDICT: REVISE
 </output_format>
 ```
 
@@ -327,7 +331,7 @@ timeout 600 codex exec \
 3. Проверить вердикт:
    - **VERDICT: APPROVED** → перейти к Шагу 8 (Готово)
    - **VERDICT: REVISE** → перейти к Шагу 6 (Правки)
-   - Нет явного вердикта, но всё позитивно → считать одобренным
+   - Нет явного вердикта → считать parse failure, запустить resume/fallback с просьбой дать чёткий вердикт
    - Достигнут максимум (5 раундов) → перейти к Шагу 8 с пометкой
 
 ### Шаг 6: Внести правки

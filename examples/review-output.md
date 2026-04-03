@@ -15,21 +15,22 @@ data integrity and authorization.
 
 ## Findings
 
-### [severity: critical] User deletion does not cascade to dependent records
+### [severity: critical] User deletion without transaction leaves partial state on failure
 
 - **File:** src/api/users.py lines 45-52
-- **What can go wrong:** Deleting a user leaves orphaned records in `orders`,
-  `sessions`, and `audit_log` tables. Foreign key constraints are set to
-  `NO ACTION`, so the delete succeeds but dependent data becomes unreferenceable.
-  Queries joining on `user_id` will silently drop rows.
-- **Why vulnerable:** The `delete_user()` function calls
-  `db.users.delete(user_id)` directly without handling related tables.
-  No cascade is configured at the database level.
-- **Impact:** Data integrity violation. Orphaned orders cannot be attributed
-  to any user. Financial reconciliation reports will undercount.
-- **Recommendation:** Either add `ON DELETE CASCADE` to foreign keys in a
-  migration, or delete dependent records explicitly in a transaction before
-  deleting the user.
+- **What can go wrong:** The `delete_user()` function deletes from `sessions`,
+  `orders`, and `users` in three separate queries without a transaction.
+  If the process crashes or the DB connection drops after deleting sessions
+  but before deleting the user, the user record persists with missing session
+  history. There is no retry or cleanup mechanism.
+- **Why vulnerable:** The function calls `db.sessions.delete(user_id)`,
+  `db.orders.delete(user_id)`, and `db.users.delete(user_id)` sequentially
+  without wrapping them in `db.transaction()`.
+- **Impact:** Data loss. Partial deletion leaves the database in an
+  inconsistent state that requires manual intervention to fix.
+- **Recommendation:** Wrap all three deletes in a single transaction:
+  `with db.transaction(): ...`. If any step fails, the entire operation
+  rolls back.
 
 ### [severity: high] Missing authorization check on delete endpoint
 
@@ -54,7 +55,7 @@ VERDICT: REVISE
 
 ### Fixes (Round 1)
 
-- Added `ON DELETE CASCADE` migration for `orders.user_id` and `sessions.user_id`
+- Wrapped all three deletes (`sessions`, `orders`, `users`) in `db.transaction()`
 - Added `@require_role('admin')` to the delete endpoint
 - Added test for unauthorized deletion attempt (returns 403)
 
@@ -64,8 +65,8 @@ VERDICT: REVISE
 
 ## Summary
 
-Both critical issues from round 1 are resolved. The cascade migration is correct
-and the authorization check is in place. No new issues found.
+Both issues from round 1 are resolved. The transaction wraps all deletes
+atomically and the authorization check is in place. No new issues found.
 
 ## Findings
 

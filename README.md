@@ -32,10 +32,10 @@ This skill is a text instruction that any AI agent can interpret.
 It actively fixes issues based on reviewer feedback and resubmits
 for re-review. Up to 5 rounds until approved.
 
-**Universal foundation** — the skill relies on basic agent capabilities:
-run a command, read a file, edit a file. The reviewer is a swappable
-component: today Codex, tomorrow Gemini CLI, next week a local model.
-Switching backends = changing one launch command; prompts and workflow stay the same.
+**Designed for extensibility** — the skill relies on basic agent capabilities:
+run a command, read a file, edit a file. The prompts and review workflow
+are model-agnostic. Currently uses OpenAI Codex as the reviewer;
+adding other backends (Gemini, local models) is on the roadmap.
 
 ## How it works
 
