@@ -98,10 +98,8 @@ permission prompts. To avoid repeated confirmations, add these to your
       "Bash(git symbolic-ref*)",
       "Bash(git rev-parse*)",
       "Bash(timeout 600 codex exec *)",
-      "Bash(rm -f /tmp/claude-plan-*)",
-      "Bash(rm -f /tmp/codex-review-*)",
-      "Write(/tmp/claude-plan-*)",
-      "Write(/tmp/codex-review-*)"
+      "Write(/tmp/codex-plan-*)",
+      "Write(/tmp/codex-prompt-*)"
     ]
   }
 }

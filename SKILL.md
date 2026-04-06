@@ -75,7 +75,7 @@ Save the result as `BASE_BRANCH` — used in `git diff ${BASE_BRANCH}...HEAD` be
 **Plan review:**
 
 - If the plan already exists as a file (in `project/`, plan file from Plan Mode, memory, or somewhere in the repo) — use the path directly. Do NOT copy. In Claude Code Plan Mode the plan is always a file.
-- If the plan is only in the conversation context (outside Plan Mode) — write via **Write tool** to `/tmp/claude-plan-${REVIEW_ID}.md`.
+- If the plan is only in the conversation context (outside Plan Mode) — write via **Write tool** to `/tmp/codex-plan-${REVIEW_ID}.md`.
 - **Always print the plan file path for the user** so they can open it in their IDE:
   `Plan for review: <file-path>`
 
@@ -314,13 +314,9 @@ timeout 600 codex exec \
 - If exit code = 124 (timeout) — inform the user and offer to retry.
 - stderr is redirected to a temp file for session ID capture and error diagnostics.
 
-**After launch:** extract the session ID from the stderr file:
+**After launch:** extract the session ID from the stderr file using **Read tool** on `/tmp/codex-stderr-${REVIEW_ID}.txt`. Find the line `session id: <uuid>` (format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) and extract the UUID value.
 
-```bash
-grep -o 'session id: [a-f0-9-]*' /tmp/codex-stderr-${REVIEW_ID}.txt | head -1 | sed 's/session id: //'
-```
-
-Save the result as `CODEX_SESSION_ID` — needed for `resume` in subsequent rounds. If grep returns empty — session ID not available, resume will not work (fallback to fresh exec).
+Save the result as `CODEX_SESSION_ID` — needed for `resume` in subsequent rounds. If the session ID is not found or does not match UUID format — resume will not work (fallback to fresh exec).
 
 **Notes:**
 - Default model: `gpt-5.4` with `model_reasoning_effort=high`. User can override via arguments.
@@ -445,8 +441,8 @@ Return to **Step 5**.
 **Outside Plan Mode:**
 
 ```bash
-rm -f /tmp/claude-plan-${REVIEW_ID}.md /tmp/codex-review-${REVIEW_ID}.md \
-      /tmp/codex-prompt-${REVIEW_ID}.md /tmp/codex-stderr-${REVIEW_ID}.txt
+rm -f /tmp/codex-prompt-${REVIEW_ID}.md /tmp/codex-review-${REVIEW_ID}.md \
+      /tmp/codex-stderr-${REVIEW_ID}.txt /tmp/codex-plan-${REVIEW_ID}.md
 ```
 
 If the user declined rm — continue without error.
