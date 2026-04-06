@@ -153,6 +153,17 @@ The skill uses XML-structured prompts inspired by adversarial review methodology
 See [examples/review-output.md](examples/review-output.md) for a sample
 adversarial review output.
 
+## Known limitations
+
+- **Plan Mode and `/tmp` writes.** In Claude Code Plan Mode, writing review
+  prompts to `/tmp` may trigger a permission prompt or cause Plan Mode to exit.
+  This does not affect review correctness — the review mode is already determined,
+  and only the plan file and temp files are modified.
+- **`resume` inherits sandbox.** The `codex exec resume` command does not accept
+  `-s` (sandbox) — sandbox is inherited from the original session. The first
+  `codex exec` call sets the sandbox to `read-only`, and all subsequent resume
+  rounds use the same setting.
+
 ## Roadmap
 
 - [ ] Gemini as alternative reviewer backend

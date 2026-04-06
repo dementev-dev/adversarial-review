@@ -16,7 +16,7 @@ Sends current work for adversarial review through an external AI model (OpenAI C
 - `/adversarial-review plan` — force plan review
 - `/adversarial-review code` — force code review
 - `/adversarial-review <file-path>` — review a specific file (argument contains `/` or `.`)
-- Override reasoning: `/adversarial-review xhigh` or `/adversarial-review low` (one of: `none`, `low`, `medium`, `high`, `xhigh`)
+- Override reasoning: `/adversarial-review xhigh` or `/adversarial-review medium` (one of: `medium`, `high`, `xhigh`)
 - Override model: `/adversarial-review model:gpt-5.3-codex` (argument with `model:` prefix)
 
 ## Instructions
@@ -295,6 +295,8 @@ Flags:
 
 **Prompt delivery:** write the prompt to `/tmp/codex-prompt-${REVIEW_ID}.md` via **Write tool**, then pass via stdin redirection (`- < file`). This avoids shell quoting issues with long XML prompts.
 
+**Plan Mode note:** Writing to `/tmp` via Write tool may trigger a permission prompt or exit Plan Mode. This is a known Claude Code limitation — Plan Mode restricts edits to the plan file only. If this happens, it does not affect review correctness: the review mode is already determined, and the skill only edits the plan file and `/tmp` temp files.
+
 ```bash
 timeout 600 codex exec \
   -m gpt-5.4 \
@@ -390,6 +392,8 @@ timeout 600 codex exec resume ${CODEX_SESSION_ID} \
 ```
 
 Use `timeout: 620000` in Bash tool parameters.
+
+**Note:** `resume` does not accept `-s` (sandbox) — sandbox is inherited from the original session. Do not pass `-s` to resume. The `-m` (model) flag is accepted if you need to override the model.
 
 stderr is redirected to temp file for diagnostics. On resume failure, check `/tmp/codex-stderr-${REVIEW_ID}.txt` for details.
 
