@@ -293,13 +293,16 @@ Flags:
 - `-s read-only` — reviewer only reads, does not write
 - `-o /tmp/codex-review-${REVIEW_ID}.md` — file for capturing output
 
+**Prompt delivery:** write the prompt to `/tmp/codex-prompt-${REVIEW_ID}.md` via **Write tool**, then pass via stdin redirection (`- < file`). This avoids shell quoting issues with long XML prompts.
+
 ```bash
 timeout 600 codex exec \
   -m gpt-5.4 \
   -c model_reasoning_effort=high \
   -s read-only \
   -o /tmp/codex-review-${REVIEW_ID}.md \
-  "PROMPT"
+  - < /tmp/codex-prompt-${REVIEW_ID}.md \
+  2>/tmp/codex-stderr-${REVIEW_ID}.txt
 ```
 
 **Important:**
@@ -307,13 +310,20 @@ timeout 600 codex exec \
 - Use `timeout: 620000` parameter in Bash tool for headroom.
 - The command is **synchronous**: when it returns, the `-o` file is ready. Do **NOT** use a poll-loop (`while/sleep`).
 - If exit code = 124 (timeout) — inform the user and offer to retry.
+- stderr is redirected to a temp file for session ID capture and error diagnostics.
 
-**After launch:** find the `session id: <uuid>` line in the output and save the value as `CODEX_SESSION_ID` — needed for `resume` in subsequent rounds.
+**After launch:** extract the session ID from the stderr file:
+
+```bash
+grep -o 'session id: [a-f0-9-]*' /tmp/codex-stderr-${REVIEW_ID}.txt | head -1 | sed 's/session id: //'
+```
+
+Save the result as `CODEX_SESSION_ID` — needed for `resume` in subsequent rounds. If grep returns empty — session ID not available, resume will not work (fallback to fresh exec).
 
 **Notes:**
 - Default model: `gpt-5.4` with `model_reasoning_effort=high`. User can override via arguments.
 - Always `-s read-only` — reviewer must not write files.
-- `-o` captures output to file. Do **NOT** run in background — the command returns control on its own.
+- `-o` captures model output to file. Session ID goes to stderr (captured separately). Do **NOT** run in background.
 
 ### Step 5: Read the review and check the verdict
 
@@ -356,11 +366,10 @@ Based on the reviewer's findings:
 
 **Resume is the primary path.** Saves tokens and preserves session context. A fresh `codex exec` without resume is an **emergency fallback** that costs significantly more tokens. Use only if resume fails.
 
-1. Run resume with stderr suppressed (`2>/dev/null`):
+1. Write the resume prompt to `/tmp/codex-prompt-${REVIEW_ID}.md` via **Write tool** (overwrite previous prompt):
 
-```bash
-timeout 600 codex exec resume ${CODEX_SESSION_ID} \
-  "I've revised based on your feedback.
+```
+I've revised based on your feedback.
 
 Here's what I changed:
 [List of fixes]
@@ -369,22 +378,32 @@ Re-review with the same adversarial stance. Focus on:
 1. Whether my fixes actually resolve the reported issues
 2. Any NEW issues introduced by the fixes
 
-End with VERDICT: APPROVED or VERDICT: REVISE" 2>/dev/null
+End with VERDICT: APPROVED or VERDICT: REVISE
+```
+
+2. Run resume via stdin redirection:
+
+```bash
+timeout 600 codex exec resume ${CODEX_SESSION_ID} \
+  - < /tmp/codex-prompt-${REVIEW_ID}.md \
+  2>/tmp/codex-stderr-${REVIEW_ID}.txt
 ```
 
 Use `timeout: 620000` in Bash tool parameters.
 
-**Why `2>/dev/null`:** `codex exec` by design separates streams — progress/metadata → stderr, final model response → stdout. Suppressing stderr gives clean output without CLI noise. The Bash tool result = review only.
+stderr is redirected to temp file for diagnostics. On resume failure, check `/tmp/codex-stderr-${REVIEW_ID}.txt` for details.
 
-2. Check the result by exit code:
+3. Check the result by exit code:
    - **exit 0** — success. stdout contains clean review. Show to user directly (Write to file and Read are **not needed**). Check VERDICT: the last non-empty line of stdout = `VERDICT: APPROVED` or `VERDICT: REVISE`. If verdict is missing → output may have been truncated, proceed to Fallback. Then apply verdict handling from Step 5 (APPROVED → Step 8, REVISE → Step 6).
    - **exit 124** — timeout. Tell the user: "Reviewer did not respond within 10 minutes" and offer to retry.
-   - **other exit code** — tell the user: "Resume failed (exit code N)". Proceed to Fallback. Diagnostics without stderr are unavailable — do not try to parse stdout as an error.
+   - **other exit code** — tell the user: "Resume failed (exit code N)". Proceed to Fallback. Check `/tmp/codex-stderr-${REVIEW_ID}.txt` for diagnostics.
 
 **Fallback** — if `resume` did not work (session expired, session ID not captured, error):
 
 1. Collect the list of changed files (same as Step 3).
-2. Launch a fresh `codex exec -o` with a description of previous rounds in the prompt.
+2. Write the fallback prompt (with description of previous rounds) to `/tmp/codex-prompt-${REVIEW_ID}.md`.
+3. Launch a fresh `codex exec` using the **same command template as Step 4** (stdin via `- < file`, stderr to temp file, `-o` for output).
+4. **Extract the new session ID** from `/tmp/codex-stderr-${REVIEW_ID}.txt` and **refresh `CODEX_SESSION_ID`** — otherwise subsequent resume attempts will use the stale session ID.
 
 Return to **Step 5**.
 
@@ -422,7 +441,8 @@ Return to **Step 5**.
 **Outside Plan Mode:**
 
 ```bash
-rm -f /tmp/claude-plan-${REVIEW_ID}.md /tmp/codex-review-${REVIEW_ID}.md
+rm -f /tmp/claude-plan-${REVIEW_ID}.md /tmp/codex-review-${REVIEW_ID}.md \
+      /tmp/codex-prompt-${REVIEW_ID}.md /tmp/codex-stderr-${REVIEW_ID}.txt
 ```
 
 If the user declined rm — continue without error.
