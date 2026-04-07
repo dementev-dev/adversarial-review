@@ -6,6 +6,8 @@ user_invocable: true
 
 # Adversarial Code Review
 
+> **Platform:** Claude Code only. This skill orchestrates Claude ↔ Codex interaction, where Claude is the executor and Codex is the external reviewer. Running this skill from Codex CLI itself creates a recursive loop — Codex would try to launch itself. If you are Codex — do NOT invoke this skill; perform the review directly.
+
 Sends current work for adversarial review through an external AI model (OpenAI Codex by default). Auto-detects what to review: **plan** or **code**. Claude fixes issues based on reviewer feedback and resubmits until approved. Maximum 5 rounds.
 
 ---
