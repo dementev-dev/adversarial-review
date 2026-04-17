@@ -117,7 +117,7 @@ chosen config file:
 // Codex: resume (cd prefix because resume has no -C flag; prompt via cat | pipe)
 "Bash(cd * && cat /tmp/codex-resume-prompt-* | timeout 600 codex exec resume *)",
 // Session-id filesystem fallback (newest rollout file in ~/.codex/sessions/)
-"Bash(find * -name rollout-*)",
+"Bash(find ~/.codex/sessions*)",
 // Temp files: prompts (initial + resume), plans, review output, JSONL stdout, stderr
 "Write(/tmp/codex-plan-*)",
 "Write(/tmp/codex-prompt-*)",
@@ -144,7 +144,7 @@ chosen config file:
       "Bash(date +%s)",
       "Bash(cat /tmp/codex-prompt-* | timeout 600 codex exec *)",
       "Bash(cd * && cat /tmp/codex-resume-prompt-* | timeout 600 codex exec resume *)",
-      "Bash(find * -name rollout-*)",
+      "Bash(find ~/.codex/sessions*)",
       "Write(/tmp/codex-plan-*)",
       "Write(/tmp/codex-prompt-*)",
       "Write(/tmp/codex-resume-prompt-*)",

@@ -361,28 +361,30 @@ cat /tmp/codex-prompt-${REVIEW_ID}.md | timeout 600 codex exec --json \
 
 3. **Capture `CODEX_SESSION_ID` — two-tier.**
 
-   **Primary: first line of JSONL stdout.** Read `/tmp/codex-stdout-${REVIEW_ID}.jsonl`. First line format:
+   **What you are looking for.** A UUID string (format `[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`) that identifies the codex session, so `codex exec resume <UUID>` in Step 7 can continue this conversation. Try the cheap source first, fall back to the filesystem only if needed.
+
+   **Primary: first line of JSONL stdout.** Read `/tmp/codex-stdout-${REVIEW_ID}.jsonl`. If non-empty, the first line has the shape:
    ```json
    {"type":"thread.started","thread_id":"<uuid>","...":...}
    ```
-   Parse as JSON and extract `thread_id`. If valid → save as `CODEX_SESSION_ID` and skip to check 4.
+   Parse it as JSON, take `thread_id`, save as `CODEX_SESSION_ID`, proceed to check 4.
 
-   **Secondary: rollout filename.** In some Claude Code sandbox configurations the `--json` stdout file is empty (0 bytes) even when the review completes successfully and `-o` is populated correctly. If the primary path yielded no `thread_id`, fall back to the filesystem:
+   **Secondary: rollout filename.** In some Claude Code sandbox configurations the `--json` stdout file is empty (0 bytes) even when the review completes successfully (`-o` is populated, exit 0, stderr clean). In that case the session is still recoverable from disk: every `codex exec` writes a rollout file named `rollout-<ISO-timestamp>-<UUID>.jsonl` under `~/.codex/sessions/YYYY/MM/DD/` (see `DESIGN.md §2.3`). The trailing UUID in the filename is the session id.
+
+   Run:
 
    ```bash
-   find ~/.codex/sessions -name 'rollout-*.jsonl' -newermt "@${CODEX_SESSIONS_BEFORE}" 2>/dev/null \
-     | sort | tail -1 \
-     | xargs -r -n1 basename \
-     | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
-     | head -1
+   find ~/.codex/sessions -name 'rollout-*.jsonl' -newermt "@${CODEX_SESSIONS_BEFORE}" -printf '%T@ %f\n' 2>/dev/null
    ```
 
-   Codex writes a rollout file named `rollout-<ISO-timestamp>-<UUID>.jsonl` (see `DESIGN.md §2.3`). The UUID in the filename is the session id that `codex exec resume` accepts.
+   This prints zero or more lines of `<epoch-mtime> <filename>` for rollout files created after the pre-exec timestamp. From the result:
 
-   - Non-empty UUID output → save as `CODEX_SESSION_ID`.
-   - Empty output (no new rollout file found within the pre-exec timestamp window) → treat as launch failure; show stderr, retry once, then abort.
+   - **Zero lines** → no rollout file was created; treat as launch failure, show stderr, retry once, then abort.
+   - **One or more lines** → pick the line with the largest epoch-mtime (there is usually just one; multiple lines indicate a parallel codex invocation in the same second). Extract the trailing UUID from that filename (the 36-char hex-and-dashes pattern above) and save as `CODEX_SESSION_ID`.
 
-   **Parallel-codex caveat:** if the user runs `codex` in parallel in the same time window, the newest rollout file may be from that other invocation. This is rare, and if it happens the round's resume will fail one of the Step 7 post-resume checks and route to the standard fallback (§4.11).
+   A single `find` invocation keeps the permission rule simple (`Bash(find ~/.codex/sessions*)`) and the parsing stays in your head — no shell pipeline needed.
+
+   **Parallel-codex caveat:** if you happened to pick a rollout from a parallel codex invocation, Step 7's resume will either succeed against the wrong session (detected later via VERDICT / severity checks) or fail at the stderr/exit-code check and route to the standard fallback (§4.11). Either outcome is recoverable.
 
 4. **Review file sanity.** (Performed again in Step 5, but note upfront.) `/tmp/codex-review-${REVIEW_ID}.md` must exist and contain a line matching `^VERDICT: (APPROVED|REVISE)$`. If not → Step 5 will handle it via retry/abort.
 
@@ -514,14 +516,11 @@ Use `timeout: 620000` in Bash tool parameters.
 3. **Review file sanity.** Read `/tmp/codex-review-${REVIEW_ID}.md` and apply the same checks as Step 5.2:
    - Missing / empty / no `^VERDICT: (APPROVED|REVISE)$` line / REVISE without `[severity:` lines → route to fallback. Do NOT update `CODEX_SESSION_ID`.
 
-**4. Only if all three checks pass** → update `CODEX_SESSION_ID` using the same two-tier capture as Step 4 check 3:
+**4. Only if all three checks pass** → refresh `CODEX_SESSION_ID` with the same two-tier approach from Step 4 check 3 (primary = first JSONL line of `/tmp/codex-stdout-${REVIEW_ID}.jsonl`; secondary = newest rollout filename with mtime > `CODEX_SESSIONS_BEFORE`, UUID extracted from the basename).
 
-   - **Primary**: parse `thread_id` from the first JSONL line of `/tmp/codex-stdout-${REVIEW_ID}.jsonl`.
-   - **Secondary (if primary empty)**: the newest `~/.codex/sessions/**/rollout-*.jsonl` with mtime > `CODEX_SESSIONS_BEFORE`; extract the trailing UUID from the filename.
+Per `DESIGN.md §2.4.4`, successful resume does not rotate the thread id — the new value equals the previous one, so this refresh is defensive. If both tiers yield nothing but the three checks passed → the resume itself was fine; keep the previous `CODEX_SESSION_ID` unchanged and continue.
 
-Per `DESIGN.md §2.4.4`, successful resume does NOT rotate the thread id — the new value equals the previous one. The update is defensive (in case a future Codex version changes this). If both tiers yielded nothing but all three checks passed → keep the previous `CODEX_SESSION_ID` unchanged.
-
-After updating `CODEX_SESSION_ID`, return to **Step 5** with the new review.
+After the refresh, return to **Step 5** with the new review.
 
 ---
 
