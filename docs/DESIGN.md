@@ -332,15 +332,19 @@ event of `codex exec resume --json <that-UUID>`. Should be identical.
 
 | Trigger | Exit code | stdout | stderr | `-o` file |
 |---|---|---|---|---|
-| Success | 0 | final text / JSONL | empty (json) or metadata+token block (non-json) | written |
+| Success (reference env) | 0 | final text / JSONL | empty (json) or metadata+token block (non-json) | written |
+| Success (affected sandbox, §6.6) | 0 | empty (`--json` suppressed) | empty | written |
 | Timeout (wrapped `timeout 600`) | 124 | partial or empty | partial | may be missing or partial |
 | Model not available (`-m bogus`) | 1 | empty | error line | not written |
 | `-o` path unwritable | 0 | final text / JSONL | `Failed to write last message file ...` line | not written |
 | Not in git work tree, no `--skip-git-repo-check` | 1 | empty | `Not inside a trusted directory ...` | not written |
 | Resume with bad UUID | 1 | empty | `thread/resume failed ...` | not written |
+| `- < file` stdin redirect (affected sandbox, §6.6) | 1 | empty | empty (!) | not written |
 
 The `-o` unwritable case is dangerous: exit code is misleading. The
 skill defends by always reading stderr even on exit 0 (see `§4.8`).
+The `- < file` exit-1-with-empty-stderr case is why the skill uses
+`cat | pipe` instead (see `§4.13`).
 
 ### §2.6. CLI gaps relevant to the skill
 
@@ -373,8 +377,10 @@ executes the skill, verified during work on this refactor.
 ### §3.2. Write and Read tools
 
 - Bypass the Bash truncation limit entirely. Prompts longer than a few
-  kilobytes should be written to a file and passed through stdin
-  redirection (`- < file`) rather than embedded as a Bash argument.
+  kilobytes should be written to a file and fed to the external
+  subprocess via pipe (`cat file | cmd -`) rather than embedded as a
+  Bash argument. See `§4.13` for why pipe is preferred over the
+  `- < file` redirect form.
 - Read can open any file — there is no skill-level restriction.
 
 ### §3.3. Safety rules on destructive git operations
@@ -991,23 +997,33 @@ find ~/.codex/sessions -name 'rollout-*.jsonl' -newermt "@${CODEX_SESSIONS_BEFOR
 Continuing from §7.1 — extract the thread id and resume.
 
 ```bash
+# Primary session-id capture (may be empty in affected sandboxes)
 THREAD_ID=$(head -1 /tmp/codex-stdout-${REVIEW_ID}.jsonl \
   | grep -oE '"thread_id":"[^"]+"' | cut -d'"' -f4)
+# Secondary: rollout-filename UUID (always works)
+if [ -z "${THREAD_ID}" ]; then
+  THREAD_ID=$(find ~/.codex/sessions -name 'rollout-*.jsonl' \
+    -newermt "@${CODEX_SESSIONS_BEFORE}" 2>/dev/null \
+    | sort | tail -1 | xargs -r -n1 basename \
+    | grep -oE '[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}')
+fi
 echo "THREAD_ID=${THREAD_ID}"                           # expect a UUID
 
 cat > /tmp/codex-resume-prompt-${REVIEW_ID}.md <<'EOF'
 Still there? Reply with VERDICT: APPROVED.
 EOF
 
-cd "${REPO_ROOT}" && timeout 300 codex exec resume --json \
+CODEX_SESSIONS_BEFORE=$(date +%s)
+cd "${REPO_ROOT}" && cat /tmp/codex-resume-prompt-${REVIEW_ID}.md \
+  | timeout 300 codex exec resume --json \
   "${THREAD_ID}" \
   -o /tmp/codex-review-${REVIEW_ID}.md \
-  - < /tmp/codex-resume-prompt-${REVIEW_ID}.md \
+  - \
   > /tmp/codex-stdout-${REVIEW_ID}.jsonl \
   2>/tmp/codex-stderr-${REVIEW_ID}.txt
 
 echo "EXIT=$?"                                          # expect 0
-head -1 /tmp/codex-stdout-${REVIEW_ID}.jsonl            # first line still has thread_id (same UUID — §2.4.4)
+head -1 /tmp/codex-stdout-${REVIEW_ID}.jsonl            # reference env: same thread_id (§2.4.4); affected env: empty
 wc -c /tmp/codex-stderr-${REVIEW_ID}.txt                # expect 0
 grep -E '^VERDICT:' /tmp/codex-review-${REVIEW_ID}.md   # expect VERDICT: APPROVED
 ```
@@ -1016,9 +1032,9 @@ grep -E '^VERDICT:' /tmp/codex-review-${REVIEW_ID}.md   # expect VERDICT: APPROV
 
 ```bash
 echo "test" > /tmp/codex-bad-resume-prompt.md
-timeout 60 codex exec resume --json \
+cat /tmp/codex-bad-resume-prompt.md | timeout 60 codex exec resume --json \
   00000000-0000-0000-0000-000000000000 \
-  - < /tmp/codex-bad-resume-prompt.md \
+  - \
   > /tmp/codex-bad-resume.stdout \
   2>/tmp/codex-bad-resume.stderr
 
