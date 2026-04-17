@@ -1169,7 +1169,27 @@ If this becomes an issue, the fix is to sanitize / escape before
 substitution, which requires careful handling of double-quoted `-C`
 argument and single-quoted `cd` prefix.
 
-### §9.5. No automated tests
+### §9.5. GNU find dependency in the filesystem session-id fallback
+
+The secondary session-id capture (`§4.1b`) uses `find -newermt "@<epoch>"`
+and `-printf`, both GNU extensions. On macOS (BSD `find`) the commands
+do not accept these flags. The skill does not detect the platform and
+does not translate commands automatically.
+
+Mitigation today: `SKILL.md` Step 4 check 3 includes a one-paragraph
+platform note that states the *goal* of the command ("list rollout
+files modified since `CODEX_SESSIONS_BEFORE`, pick newest, extract
+UUID from filename") and invites the operator or the lead to substitute
+an equivalent BSD-compatible command (`find ... -type f` + `stat -f
+'%m %N'`, or `ls -t ... | head -1` against a reference marker file).
+This is a "template + understanding" approach: rely on the lead's
+adaptability rather than branching the skill for every platform.
+
+If BSD support ever becomes load-bearing (a macOS-running user base,
+a CI on macOS runners), this can be upgraded to a bundled portable
+command variant or a platform-detection branch.
+
+### §9.6. No automated tests
 
 `§7. Smoke test protocol` is manual. Automating it would require:
 

@@ -384,6 +384,8 @@ cat /tmp/codex-prompt-${REVIEW_ID}.md | timeout 600 codex exec --json \
 
    A single `find` invocation keeps the permission rule simple (`Bash(find ~/.codex/sessions*)`) and the parsing stays in your head — no shell pipeline needed.
 
+   **Platform note.** `-newermt "@<epoch>"` and `-printf` are GNU extensions. On macOS (BSD find) they are unsupported — substitute an equivalent that achieves the same goal: "list rollout files modified since `${CODEX_SESSIONS_BEFORE}`, newest first". For example, `find ~/.codex/sessions -name 'rollout-*.jsonl' -type f` plus `stat -f '%m %N' <path>` per result, or `ls -t ~/.codex/sessions/*/*/*/rollout-*.jsonl` and filter by a reference file's mtime. The goal is what matters, not the exact flags.
+
    **Parallel-codex caveat:** if you happened to pick a rollout from a parallel codex invocation, Step 7's resume will either succeed against the wrong session (detected later via VERDICT / severity checks) or fail at the stderr/exit-code check and route to the standard fallback (§4.11). Either outcome is recoverable.
 
 4. **Review file sanity.** (Performed again in Step 5, but note upfront.) `/tmp/codex-review-${REVIEW_ID}.md` must exist and contain a line matching `^VERDICT: (APPROVED|REVISE)$`. If not → Step 5 will handle it via retry/abort.

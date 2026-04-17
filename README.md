@@ -262,6 +262,12 @@ review correctness.
   scoped to the submodule — `git rev-parse --show-toplevel` does not walk
   up to the parent. A warning is printed; invoke from the parent repo if
   you want parent scope.
+- **GNU find on macOS.** The secondary session-id capture uses
+  `find -newermt "@<epoch>"` and `-printf`, both GNU extensions. On
+  macOS (BSD find) the skill's default command does not work; the skill
+  states the *goal* of the step in SKILL.md and invites the model (or
+  user) to substitute an equivalent BSD-compatible command. The skill
+  has not been end-to-end tested on macOS.
 
 ## Roadmap
 
