@@ -460,9 +460,15 @@ Each decision below follows the same template:
   - *Use only the filesystem path as the single source.* Rejected:
     relies on a filesystem race window against any parallel codex
     invocation in the same second. As a secondary (only consulted
-    when stdout is empty) the race is rare, and when it does hit,
-    one of the Step 7 post-resume checks (`§4.8`) catches the wrong
-    session and routes to the standard fallback (`§4.11`).
+    when stdout is empty) the race is rare, but — honestly — NOT
+    auto-detectable by the skill: a wrong-session resume returns a
+    normally-shaped review (VERDICT + `[severity:` markers), so the
+    Step 7 post-resume checks (`§4.8`) pass and the skill applies
+    fixes based on an unrelated artifact. The `CODEX_SESSIONS_BEFORE`
+    timestamp narrows the race window to seconds, but does not
+    eliminate it. Risk is acknowledged in `SKILL.md` Step 4 check 4
+    ("Parallel-codex caveat") as a silent-corruption hazard, not a
+    fallback-handled hazard.
   - *Drop `--json` entirely and use plain-text stdout.* Rejected:
     `--json` makes stdout machine-readable only, which is *load-
     bearing* for the show-review gate (`§4.9`). Plain-text stdout
@@ -477,10 +483,18 @@ Each decision below follows the same template:
   - Human-readable review is no longer in stdout (it went to `-o`
     only) — load-bearing for `§4.9`.
   - Secondary path introduces a filesystem race against parallel
-    codex invocations (§9.1 scope). Mitigated by the pre-exec
-    timestamp (`CODEX_SESSIONS_BEFORE`) narrowing the window to
-    "files created between the two timestamps" rather than "newest
-    anywhere".
+    codex invocations (§9.1 scope). Mitigated (not eliminated) by
+    the pre-exec timestamp (`CODEX_SESSIONS_BEFORE=$(($(date +%s) -
+    1))`) narrowing the window to "files created within ~1-2 seconds
+    of the exec start". The `-1` shift against `-newermt`'s strict-
+    greater semantics prevents same-epoch miss; the race window is
+    one second wider as a result, still negligible compared to a
+    real codex exec duration.
+  - Session-id capture happens only after review-file sanity passes
+    AND only when verdict is `REVISE` (Step 4 check order in
+    `SKILL.md`). This avoids aborting a valid round-1 APPROVED over
+    a secondary-capture failure: APPROVED means no resume, no
+    session-id needed.
   - Extra permission surface: `Bash(find ...)` is now in the
     recommended permissions list.
 
@@ -615,16 +629,30 @@ Each decision below follows the same template:
   prompt wording; prompt drift would be a separate failure mode (see
   §6).
 
-### §4.8. Strict check order: exit → stderr → review file
+### §4.8. Strict check order: exit → stderr → review → (session-id when needed)
 
 - **Decision.** After every `codex exec` / `codex exec resume` call,
-  checks are run in a fixed order: exit code first, then stderr file
-  (even on exit 0), then the `-o` review file.
+  checks run in a fixed order:
+  1. Exit code.
+  2. Stderr file (even on exit 0).
+  3. `-o` review file semantic sanity.
+  4. Session-id capture (two-tier, `§4.1`). In Step 4 this is skipped
+     on `VERDICT: APPROVED` — no resume will happen, so no session
+     is needed. In Step 7 it is a defensive refresh (thread id
+     doesn't rotate per `§2.4.4`) and is skipped identically on
+     APPROVED.
 - **Where in SKILL.md.** Steps 4 and 7 post-launch.
 - **Context.** Non-zero exit implies `-o` may not exist; reading it
   would crash. Exit 0 does not imply everything is fine (e.g., `-o`
-  unwritable case, §2.5). A defined order routes every failure mode to
-  the right diagnostic without the lead having to improvise.
+  unwritable case, §2.5). Review-sanity before session-id keeps the
+  two concerns orthogonal: a broken review aborts on its own merits,
+  and a valid APPROVED review completes without depending on
+  session-id capture. An earlier draft ordered session-id *before*
+  review-sanity, which meant a secondary-capture failure (e.g.,
+  empty `~/.codex/sessions/` on a first-ever codex run, or a super-
+  fast codex exec hitting the `-newermt` same-epoch edge) would
+  abort an otherwise-successful APPROVED round. The current order
+  avoids that.
 - **Alternatives considered.**
   - *Ad-hoc checks in whatever order.* Rejected: invites null-pointer-
     style crashes on missing files.
