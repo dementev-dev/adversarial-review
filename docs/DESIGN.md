@@ -240,19 +240,30 @@ requires persistence.
 **Session-id recovery from the filesystem.** Because the UUID is a
 deterministic suffix of the filename, session id can be recovered from
 disk after the fact, independent of whether `--json` emitted the
-`thread.started` event to stdout. The skill uses this as a secondary
-capture path (`§4.1b`) when stdout is empty.
+`thread.started` event to stdout. The rollout JSONL body also contains
+the initial prompt text — so the skill can positively bind by putting
+a unique marker in the prompt (`REVIEW_ID`) and grepping for it
+across candidate rollouts, rather than relying on timing alone. The
+skill uses this as a secondary capture path (`§4.1b`) when stdout is
+empty.
 
 Verify:
 
 ```bash
-BEFORE=$(date +%s)
-echo "respond PONG" | codex exec -m gpt-5.4 -s read-only \
+MARKER="PROBE-$(date +%s)-$$"
+cat > /tmp/x-prompt.md <<EOF
+<!-- ${MARKER} -->
+respond PONG
+EOF
+cat /tmp/x-prompt.md | codex exec -m gpt-5.4 -s read-only \
   --skip-git-repo-check -o /tmp/x.md - >/dev/null 2>&1
-find ~/.codex/sessions -name 'rollout-*.jsonl' -newermt "@${BEFORE}" \
-  | sort | tail -1 | xargs -n1 basename \
+ROLLOUT=$(find ~/.codex/sessions -name 'rollout-*.jsonl' \
+  -newer /tmp/x-prompt.md \
+  -exec grep -l "${MARKER}" {} + 2>/dev/null | head -1)
+basename "${ROLLOUT}" .jsonl \
   | grep -oE '[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}'
 # expect: a UUID, and that UUID accepted by `codex exec resume`
+rm -f /tmp/x-prompt.md /tmp/x.md
 ```
 
 ### §2.4. Resume semantics
@@ -422,82 +433,91 @@ Each decision below follows the same template:
 - **Chosen because** — the load-bearing argument.
 - **Trade-offs accepted** — what we gave up.
 
-### §4.1. Two-tier session ID capture (`--json` primary, rollout filename secondary)
+### §4.1. Two-tier session ID capture (`--json` primary, positive content-bind secondary)
 
 - **Decision.** Every `codex exec` and `codex exec resume` invocation
   uses `--json` with stdout redirected to
-  `/tmp/codex-stdout-${REVIEW_ID}.jsonl`. Session ID capture tries
-  **primary first, then secondary**:
+  `/tmp/codex-stdout-${REVIEW_ID}.jsonl`. Every prompt (initial, resume,
+  fresh-exec fallback) starts with a session marker
+  `<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID} -->` as its first line.
+  Session ID capture then tries:
   - **Primary** (`§4.1a`): parse `thread_id` from the first line of
     JSONL stdout.
-  - **Secondary** (`§4.1b`): if stdout is empty, extract the UUID from
-    the filename of the newest `~/.codex/sessions/**/rollout-*.jsonl`
-    with `mtime > CODEX_SESSIONS_BEFORE` (a timestamp captured
-    immediately before the exec).
-- **Where in SKILL.md.** Step 4 (launch), Step 7 (resume). Both tiers
-  live inline in each Step.
+  - **Secondary** (`§4.1b`): the rollout file that is both `-newer` than
+    the prompt file AND contains the session marker (grep), with UUID
+    extracted from the filename:
+    ```
+    find ~/.codex/sessions -name 'rollout-*.jsonl' \
+      -newer /tmp/codex-prompt-${REVIEW_ID}.md \
+      -exec grep -l 'ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}' {} +
+    ```
+    All flags (`-newer FILE`, `-exec CMD {} +`, `grep -l`) are POSIX —
+    the command works unchanged on Linux and macOS. If the grep returns
+    zero paths, the fallback **fails closed**: the skill cannot safely
+    pick an unrelated rollout.
+- **Where in SKILL.md.** Step 4 (launch), Step 7 (resume), Step 7 fresh-
+  exec fallback. All three sites use the same positive-binding pattern,
+  differing only in which prompt file anchors the `-newer` check.
 - **Context.** The primary path covers the reference environment
   cleanly (JSONL events reliably land in the redirected file). In at
-  least one Claude Code sandbox, the JSONL stdout is suppressed (0
-  bytes) even on exit 0 and a populated `-o` review file (`§2.2`,
-  `§6.6`). Without a secondary path, the skill cannot resume in that
-  environment — every round would need a fresh `codex exec`, wasting
-  tokens on project re-reads. The filesystem path was previously
-  rejected (see "Alternatives considered" below) but the rejection
-  only applies when it is the *primary* capture; as a *secondary*
-  fallback its failure modes are acceptable.
+  least one Claude Code sandbox the JSONL stdout is suppressed (0 bytes)
+  even on exit 0 with populated `-o` (`§2.2`, `§6.6`), and without a
+  secondary path the skill cannot resume — every round becomes a fresh
+  `codex exec`, wasting tokens on project re-reads. An earlier iteration
+  of this secondary (mtime-only: newest rollout with mtime >
+  `CODEX_SESSIONS_BEFORE`) was rejected in Round 6 of adversarial review
+  because it binds on timing alone: a parallel codex invocation running
+  during the exec window creates a newer rollout, which the fallback
+  then silently picks — Step 7's post-resume checks (`§4.8`) see a
+  normally-shaped wrong-session response and the skill applies fixes
+  informed by an unrelated artifact. Positive content-binding via the
+  session marker eliminates this entirely: only rollouts containing our
+  specific `REVIEW_ID` pass the grep filter.
 - **Alternatives considered.**
   - *Keep parsing `session id:` from stderr.* Rejected: Bash tool
-    truncates output at ~30 KB from the head (§3.1); long reasoning
+    truncates output at ~30 KB from the head (`§3.1`); long reasoning
     traces pushed the session-id line out of the retained window.
     (Historical reason for moving to `--json` in the first place.)
-  - *Redirect stderr to a file, Read via Read tool.* Rejected: an
-    earlier skill version did exactly this and a diagnostic dump still
-    reported empty stderr files. §3.2 says Read bypasses Bash
-    truncation, so this might have been viable — but since `§4.1a`
-    covers the reference environment and `§4.1b` covers the sandboxed
-    one, adding a third path is not worth the complexity.
-  - *Use only the filesystem path as the single source.* Rejected:
-    relies on a filesystem race window against any parallel codex
-    invocation in the same second. As a secondary (only consulted
-    when stdout is empty) the race is rare, but — honestly — NOT
-    auto-detectable by the skill: a wrong-session resume returns a
-    normally-shaped review (VERDICT + `[severity:` markers), so the
-    Step 7 post-resume checks (`§4.8`) pass and the skill applies
-    fixes based on an unrelated artifact. The `CODEX_SESSIONS_BEFORE`
-    timestamp narrows the race window to seconds, but does not
-    eliminate it. Risk is acknowledged in `SKILL.md` Step 4 check 4
-    ("Parallel-codex caveat") as a silent-corruption hazard, not a
-    fallback-handled hazard.
+  - *Redirect stderr to a file, Read via Read tool.* Rejected: since
+    `§4.1a` covers the reference env cleanly and `§4.1b` covers the
+    sandboxed env, adding a third path is not worth the complexity.
+  - *Newest-rollout-by-mtime (timestamp-only bind).* Rejected in
+    Round 6: parallel codex invocation race produces silent
+    wrong-session corruption (details in `§6.6`). Superseded by
+    positive content-bind.
+  - *Write a dedicated marker file on disk (e.g.,
+    `/tmp/codex-start-${REVIEW_ID}.marker`) and grep rollouts for that
+    file's path.* Rejected: adds another temp-file artifact to manage
+    and clean up. The prompt file is already written for the launch
+    and can serve as both the `-newer` anchor and (via embedded
+    marker) the grep target — no new file needed.
+  - *Embed `REVIEW_ID` as an XML element inside the prompt rather
+    than as an HTML comment.* Rejected: a prompt-level XML element
+    could interfere with the reviewer's parsing or be surfaced in
+    the reviewer's response as if it were content to address. An
+    HTML-style comment at the top is unambiguous metadata to any
+    reader and survives intact in the rollout JSONL where grep sees
+    it.
   - *Drop `--json` entirely and use plain-text stdout.* Rejected:
     `--json` makes stdout machine-readable only, which is *load-
     bearing* for the show-review gate (`§4.9`). Plain-text stdout
     would re-expose the "Opus sees the review in Bash result, skips
     the user-visible show step" failure mode.
-- **Chosen because.** Two-tier keeps primary cheap and documented on
-  the Codex side (the `thread.started` event is in the CLI contract),
-  while the secondary isolates the skill from env-specific stdout
-  quirks we cannot control (`§6.6`). Neither tier alone covers both
-  observed environments; together they do.
+- **Chosen because.** Primary is cheap and documented on the Codex side
+  (the `thread.started` event is in the CLI contract). Secondary is
+  positively-bound: zero ambiguity between our rollout and any other.
+  Together they cover both observed environments without a silent-
+  corruption risk from parallel codex.
 - **Trade-offs accepted.**
   - Human-readable review is no longer in stdout (it went to `-o`
     only) — load-bearing for `§4.9`.
-  - Secondary path introduces a filesystem race against parallel
-    codex invocations (§9.1 scope). Mitigated (not eliminated) by
-    the pre-exec timestamp `CODEX_SESSIONS_BEFORE` (computed by the
-    lead in-reasoning as "current Unix timestamp minus 1" and
-    substituted as a literal integer — no Bash call), narrowing the
-    window to "files created within ~1-2 seconds of the exec start".
-    The `-1` shift against `-newermt`'s strict-greater semantics
-    prevents same-epoch miss; the race window is one second wider as
-    a result, still negligible compared to a real codex exec
-    duration.
+  - Every prompt now has a leading HTML-comment line. Reviewer sees
+    it but ignores (Codex treats it as non-instructional content).
   - Session-id capture happens only after review-file sanity passes
-    AND only when verdict is `REVISE` (Step 4 check order in
-    `SKILL.md`). This avoids aborting a valid round-1 APPROVED over
-    a secondary-capture failure: APPROVED means no resume, no
-    session-id needed.
-  - Extra permission surface: `Bash(find ...)` is now in the
+    AND only when verdict is `REVISE` (Step 4 check order). This
+    avoids aborting a valid round-1 APPROVED over a secondary
+    failure: APPROVED means no resume, no session-id needed.
+  - Extra permission surface: `Bash(find ~/.codex/sessions*)` in the
     recommended permissions list.
 
 ### §4.2. Capture `REPO_ROOT` at Step 2, substitute literally
@@ -651,10 +671,9 @@ Each decision below follows the same template:
   and a valid APPROVED review completes without depending on
   session-id capture. An earlier draft ordered session-id *before*
   review-sanity, which meant a secondary-capture failure (e.g.,
-  empty `~/.codex/sessions/` on a first-ever codex run, or a super-
-  fast codex exec hitting the `-newermt` same-epoch edge) would
-  abort an otherwise-successful APPROVED round. The current order
-  avoids that.
+  empty `~/.codex/sessions/` on a first-ever codex run, or a rollout
+  that somehow lacked the session marker) would abort an otherwise-
+  successful APPROVED round. The current order avoids that.
 - **Alternatives considered.**
   - *Ad-hoc checks in whatever order.* Rejected: invites null-pointer-
     style crashes on missing files.
@@ -973,6 +992,55 @@ environment) proved the skill contract worked — in that environment.
 It did not prove the contract worked universally. Contract verification
 is env-specific until demonstrated otherwise.
 
+### §6.7. 2026-04-17 (Round 6): Silent wrong-session corruption from timestamp-only fallback
+
+**Claim trajectory.** Rounds 1-5 of development converged on a two-tier
+session-id design where the secondary path identified our rollout as
+"newest `rollout-*.jsonl` with mtime greater than a captured pre-exec
+timestamp". Rounds 4 and 5 of self-review noted the parallel-codex
+hazard but accepted it as a documented limitation: a narrow race
+window + `--last` being unused were argued as sufficient mitigation.
+
+**Reality (Round 6 team review).** A parallel codex invocation in any
+shell on the same machine (user running `codex` in another terminal,
+a CI job, a hook, etc.) creates a newer rollout during the review's
+exec window. The skill's `find -newermt + pick newest` then captures
+that unrelated UUID. `codex exec resume <UUID>` succeeds against that
+thread, returns a normally-shaped review (`VERDICT:`, `[severity:`)
+for an unrelated artifact, and Step 7's post-resume checks pass. The
+skill applies "fixes" informed by a review of some other work.
+
+Neither the narrow window nor the absence of `--last` actually
+closes this: a parallel codex starting even seconds after the skill's
+exec still qualifies for the window, and not using `--last` does not
+help because the fallback explicitly picks newest-by-mtime anyway.
+
+**Root cause of the misdiagnosis.** Both self-reviews underestimated
+the likelihood of parallel codex (operators running `codex` in a side
+terminal is common during development), and both treated the narrow
+timing window as equivalent to "safe enough". The reviewer recommended
+fail-closed unless a rollout can be positively bound to this launch.
+
+**Mitigation.** Replaced the timestamp-only secondary with positive
+content-binding (`§4.1b`): every prompt embeds
+`<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID} -->` as its first line,
+and the fallback uses `find -newer <prompt-file> -exec grep -l
+'...${REVIEW_ID}' {} +`. Only rollouts whose transcript contains our
+specific `REVIEW_ID` pass the grep; everything else (including any
+parallel codex's rollout) is invisible. Zero matches → fail closed.
+
+As a side benefit, all flags used are POSIX (`-newer FILE`, `-exec
+CMD {} +`, `grep -l`) — the GNU-find dependency documented as a
+known limitation in the prior iteration of `§9.5` went away.
+
+**Lesson (augmenting §6.5).** When documenting a "narrow window"
+mitigation, ask: what is the failure mode *when* the race fires, and
+how would the skill know? If the answer is "silent incorrect output
+that passes the skill's own sanity checks", the mitigation is
+insufficient regardless of how narrow the window is. Positive binding
+by content (not by timing) is the correct answer; fail-closed on
+no-match is the correct default.
+
 ---
 
 ## §7. Smoke test protocol
@@ -989,8 +1057,8 @@ the repo root. Expected outputs are in comments.
 ```bash
 REVIEW_ID=$(date +%s)-$(printf '%08d' $RANDOM)
 REPO_ROOT=$(git rev-parse --show-toplevel)
-CODEX_SESSIONS_BEFORE=$(date +%s)
-cat > /tmp/codex-prompt-${REVIEW_ID}.md <<'EOF'
+cat > /tmp/codex-prompt-${REVIEW_ID}.md <<EOF
+<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID} -->
 <role>
 You are a senior adversarial reviewer of implementation plans.
 </role>
@@ -1015,11 +1083,13 @@ head -1 /tmp/codex-stdout-${REVIEW_ID}.jsonl            # reference env: thread.
 wc -c /tmp/codex-stderr-${REVIEW_ID}.txt                # expect 0
 grep -E '^VERDICT:' /tmp/codex-review-${REVIEW_ID}.md   # expect VERDICT: APPROVED
 
-# Verify the filesystem secondary path also works (§4.1b)
-find ~/.codex/sessions -name 'rollout-*.jsonl' -newermt "@${CODEX_SESSIONS_BEFORE}" \
-  | sort | tail -1 | xargs -r -n1 basename \
-  | grep -oE '[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}'
-# expect: one UUID. If head -1 stdout had thread_id, this UUID should match.
+# Verify the filesystem secondary path also works (§4.1b) — positive content-bind.
+# Returns the rollout path that both postdates our prompt file AND contains the marker.
+find ~/.codex/sessions -name 'rollout-*.jsonl' \
+  -newer /tmp/codex-prompt-${REVIEW_ID}.md \
+  -exec grep -l "ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}" {} + 2>/dev/null
+# expect: exactly one path. Extract the UUID from basename — it must equal the
+# thread_id from the primary path above (if the primary was populated).
 ```
 
 ### §7.2. Resume with cd prefix
@@ -1030,20 +1100,22 @@ Continuing from §7.1 — extract the thread id and resume.
 # Primary session-id capture (may be empty in affected sandboxes)
 THREAD_ID=$(head -1 /tmp/codex-stdout-${REVIEW_ID}.jsonl \
   | grep -oE '"thread_id":"[^"]+"' | cut -d'"' -f4)
-# Secondary: rollout-filename UUID (always works)
+# Secondary: positive content-bind (§4.1b). POSIX-portable.
 if [ -z "${THREAD_ID}" ]; then
-  THREAD_ID=$(find ~/.codex/sessions -name 'rollout-*.jsonl' \
-    -newermt "@${CODEX_SESSIONS_BEFORE}" 2>/dev/null \
-    | sort | tail -1 | xargs -r -n1 basename \
+  ROLLOUT=$(find ~/.codex/sessions -name 'rollout-*.jsonl' \
+    -newer /tmp/codex-prompt-${REVIEW_ID}.md \
+    -exec grep -l "ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}" {} + 2>/dev/null \
+    | head -1)
+  THREAD_ID=$(basename "${ROLLOUT}" .jsonl \
     | grep -oE '[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}')
 fi
 echo "THREAD_ID=${THREAD_ID}"                           # expect a UUID
 
-cat > /tmp/codex-resume-prompt-${REVIEW_ID}.md <<'EOF'
+cat > /tmp/codex-resume-prompt-${REVIEW_ID}.md <<EOF
+<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID} -->
 Still there? Reply with VERDICT: APPROVED.
 EOF
 
-CODEX_SESSIONS_BEFORE=$(date +%s)
 cd "${REPO_ROOT}" && cat /tmp/codex-resume-prompt-${REVIEW_ID}.md \
   | timeout 300 codex exec resume --json \
   "${THREAD_ID}" \
@@ -1142,6 +1214,7 @@ If §7.1–§7.5 do not produce the expected outputs:
 |------|-----------|-------------|----------|-------|
 | 2026-04-17 | 0.121.0 | current at time of refactor | initial author | All §2 facts verified; §7 smoke test passes end to end. Initial commit of this document. |
 | 2026-04-17 | 0.121.0 | containerized sandbox (yantar-k8s) | external agent + lead | §7.1 `- < file` form fails EXIT=1 with empty stderr. `cat \| pipe` form works for `-o` review, but `--json` stdout is empty. Filesystem secondary session-id capture (§4.1b) verified functional: UUID extracted from rollout filename successfully resumes. Not a version issue (reproduced on 0.120.0 and 0.121.0). Root cause undiagnosed — see §6.6. Skill adapted: `§4.1` now two-tier, `§4.13` switches canonical form to `cat \| pipe`. |
+| 2026-04-17 | 0.121.0 | reference env (WSL2) | live dogfood + team review | Round 6: timestamp-only secondary (§4.1b as of round 5) flagged for silent wrong-session hazard against parallel codex. Verified empirically that rollout JSONL contains prompt text (3 matches of prompt content via grep). Replaced with positive content-binding: prompt marker `<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID} -->` + `find -newer <prompt> -exec grep -l <REVIEW_ID> {} +`. All flags POSIX — GNU-find dependency of earlier §9.5 goes away. See §6.7. |
 
 When you re-verify (either during routine maintenance or when
 triggered by §7.7), add a row. Keep the log chronological.
@@ -1199,25 +1272,23 @@ If this becomes an issue, the fix is to sanitize / escape before
 substitution, which requires careful handling of double-quoted `-C`
 argument and single-quoted `cd` prefix.
 
-### §9.5. GNU find dependency in the filesystem session-id fallback
+### §9.5. macOS not end-to-end tested
 
-The secondary session-id capture (`§4.1b`) uses `find -newermt "@<epoch>"`
-and `-printf`, both GNU extensions. On macOS (BSD `find`) the commands
-do not accept these flags. The skill does not detect the platform and
-does not translate commands automatically.
+The secondary session-id capture (`§4.1b`) uses only POSIX find flags
+(`-newer FILE`, `-exec CMD {} +`) and POSIX `grep -l`, so it should
+work identically on macOS as on Linux. However, the skill has not
+been end-to-end tested on macOS. Edge cases that may differ:
 
-Mitigation today: `SKILL.md` Step 4 check 4 includes a one-paragraph
-platform note that states the *goal* of the command ("list rollout
-files modified since `CODEX_SESSIONS_BEFORE`, pick newest, extract
-UUID from filename") and invites the operator or the lead to substitute
-an equivalent BSD-compatible command (`find ... -type f` + `stat -f
-'%m %N'`, or `ls -t ... | head -1` against a reference marker file).
-This is a "template + understanding" approach: rely on the lead's
-adaptability rather than branching the skill for every platform.
+- Default shell (zsh on modern macOS vs bash on Linux) — the skill's
+  Bash-tool commands do not rely on bash-specific features (the
+  `cat | pipe` form is POSIX), so this is unlikely to matter.
+- `~/.codex/sessions` layout — expected identical on both platforms
+  (codex-cli is cross-platform).
+- Permission prompts for `find ~/.codex/sessions*` — should match
+  the pattern on any Claude Code harness.
 
-If BSD support ever becomes load-bearing (a macOS-running user base,
-a CI on macOS runners), this can be upgraded to a bundled portable
-command variant or a platform-detection branch.
+If a macOS user reports breakage, add findings to `§6` and file a
+version-log row in `§8`.
 
 ### §9.6. No automated tests
 

@@ -114,7 +114,7 @@ chosen config file:
 "Bash(cat /tmp/codex-prompt-* | timeout 600 codex exec *)",
 // Codex: resume (cd prefix because resume has no -C flag; prompt via cat | pipe)
 "Bash(cd * && cat /tmp/codex-resume-prompt-* | timeout 600 codex exec resume *)",
-// Session-id filesystem fallback (newest rollout file in ~/.codex/sessions/)
+// Session-id filesystem fallback (POSIX: find -newer + grep -l for content-match)
 "Bash(find ~/.codex/sessions*)",
 // Diagnostic aid when filesystem fallback finds nothing
 "Bash(ls -t ~/.codex/sessions*)",
@@ -229,9 +229,15 @@ In some Claude Code sandbox configurations codex's `--json` event stream is
 suppressed when stdout is redirected to a file — the `/tmp/codex-stdout-*.jsonl`
 ends up 0 bytes even though the review itself (`-o /tmp/codex-review-*.md`)
 completes correctly. The skill handles this automatically via a filesystem
-fallback: when the JSONL stream is empty it extracts the session UUID from
-the newest `~/.codex/sessions/YYYY/MM/DD/rollout-*-<UUID>.jsonl` filename
-created since the pre-exec timestamp. Resume continues to work normally.
+fallback: every prompt includes a unique session marker
+(`<!-- ADVERSARIAL-REVIEW-SESSION: <REVIEW_ID> -->`) that gets written to
+the rollout JSONL on disk. When the JSONL stream is empty, the skill runs
+`find ~/.codex/sessions -name 'rollout-*.jsonl' -newer <prompt-file> -exec
+grep -l <REVIEW_ID> {} +` to positively identify this session's rollout by
+content match (not by newest-mtime, which would be unsafe against parallel
+codex invocations) and extracts the UUID from the filename. Resume continues
+to work normally. The commands used are POSIX (`find -newer`, `-exec grep -l`)
+and work identically on Linux and macOS.
 
 **"NOT VERIFIED" result.**
 The skill applied fixes but the reviewer did not re-verify them (resume
@@ -267,12 +273,10 @@ review correctness.
   scoped to the submodule — `git rev-parse --show-toplevel` does not walk
   up to the parent. A warning is printed; invoke from the parent repo if
   you want parent scope.
-- **GNU find on macOS.** The secondary session-id capture uses
-  `find -newermt "@<epoch>"` and `-printf`, both GNU extensions. On
-  macOS (BSD find) the skill's default command does not work; the skill
-  states the *goal* of the step in SKILL.md and invites the model (or
-  user) to substitute an equivalent BSD-compatible command. The skill
-  has not been end-to-end tested on macOS.
+- **macOS end-to-end not tested.** The secondary session-id capture
+  uses only POSIX flags (`find -newer FILE`, `-exec CMD {} +`, `grep -l`),
+  so it should work identically on macOS as on Linux, but the skill has
+  not been end-to-end tested on macOS.
 
 ## Roadmap
 
