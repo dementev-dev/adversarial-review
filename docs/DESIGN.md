@@ -433,28 +433,32 @@ Each decision below follows the same template:
 - **Chosen because** — the load-bearing argument.
 - **Trade-offs accepted** — what we gave up.
 
-### §4.1. Two-tier session ID capture (`--json` primary, positive content-bind secondary)
+### §4.1. Two-tier session ID capture (`--json` primary, attempt-scoped content-bind secondary)
 
 - **Decision.** Every `codex exec` and `codex exec resume` invocation
   uses `--json` with stdout redirected to
-  `/tmp/codex-stdout-${REVIEW_ID}.jsonl`. Every prompt (initial, resume,
-  fresh-exec fallback) starts with a session marker
-  `<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID} -->` as its first line.
+  `/tmp/codex-stdout-${REVIEW_ID}.jsonl`. Every prompt (initial, retry,
+  resume, fresh-exec fallback) starts with a per-launch session marker
+  `<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID} -->` as
+  its first line, where `${REVIEW_ID}` is review-stable and
+  `${ATTEMPT_ID}` is a fresh 6-digit random regenerated **per launch**.
   Session ID capture then tries:
   - **Primary** (`§4.1a`): parse `thread_id` from the first line of
     JSONL stdout.
   - **Secondary** (`§4.1b`): the rollout file that is both `-newer` than
-    the prompt file AND contains the session marker (grep), with UUID
-    extracted from the filename:
+    the prompt file AND contains this launch's specific attempt marker
+    (grep), with UUID extracted from the filename:
     ```
     find ~/.codex/sessions -name 'rollout-*.jsonl' \
       -newer /tmp/codex-prompt-${REVIEW_ID}.md \
-      -exec grep -l 'ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}' {} +
+      -exec grep -l 'ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID}' {} +
     ```
     All flags (`-newer FILE`, `-exec CMD {} +`, `grep -l`) are POSIX —
-    the command works unchanged on Linux and macOS. If the grep returns
-    zero paths, the fallback **fails closed**: the skill cannot safely
-    pick an unrelated rollout.
+    works unchanged on Linux and macOS. Zero paths → **fail closed**
+    (the skill cannot safely pick an unrelated rollout). Two or more
+    paths → also **fail closed** (see "Trade-offs" for why this cannot
+    happen under correct attempt-scoping and why masking it would be
+    worse than aborting visibly).
 - **Where in SKILL.md.** Step 4 (launch), Step 7 (resume), Step 7 fresh-
   exec fallback. All three sites use the same positive-binding pattern,
   differing only in which prompt file anchors the `-newer` check.
@@ -465,14 +469,16 @@ Each decision below follows the same template:
   secondary path the skill cannot resume — every round becomes a fresh
   `codex exec`, wasting tokens on project re-reads. An earlier iteration
   of this secondary (mtime-only: newest rollout with mtime >
-  `CODEX_SESSIONS_BEFORE`) was rejected in Round 6 of adversarial review
-  because it binds on timing alone: a parallel codex invocation running
-  during the exec window creates a newer rollout, which the fallback
-  then silently picks — Step 7's post-resume checks (`§4.8`) see a
-  normally-shaped wrong-session response and the skill applies fixes
-  informed by an unrelated artifact. Positive content-binding via the
-  session marker eliminates this entirely: only rollouts containing our
-  specific `REVIEW_ID` pass the grep filter.
+  `CODEX_SESSIONS_BEFORE`) was rejected in Round 6 because it binds on
+  timing alone — parallel codex creates a newer rollout that is
+  silently picked. The next iteration (content-bind on `${REVIEW_ID}`
+  alone) was rejected in Round 7 because `REVIEW_ID` is review-stable:
+  a retry inside the same review can legitimately leave two rollouts
+  both matching the grep, and the skill then has to "pick one." The
+  current design attempt-scopes the marker: `${ATTEMPT_ID}` is fresh
+  per launch, so only THIS exact exec/retry/resume/fresh-exec run
+  matches. Everything else — parallel codex, stale retry, prior
+  attempts of the same review — is invisible to the grep.
 - **Alternatives considered.**
   - *Keep parsing `session id:` from stderr.* Rejected: Bash tool
     truncates output at ~30 KB from the head (`§3.1`); long reasoning
@@ -483,8 +489,16 @@ Each decision below follows the same template:
     sandboxed env, adding a third path is not worth the complexity.
   - *Newest-rollout-by-mtime (timestamp-only bind).* Rejected in
     Round 6: parallel codex invocation race produces silent
-    wrong-session corruption (details in `§6.6`). Superseded by
+    wrong-session corruption (details in `§6.7`). Superseded by
     positive content-bind.
+  - *Review-stable marker (`REVIEW_ID` alone, no per-launch nonce).*
+    Rejected in Round 7 (`§6.8`): SKILL.md explicitly allows one
+    retry per round on launch failure, so a first attempt and its
+    retry share the same REVIEW_ID; both rollouts match the grep;
+    the skill's fallback must "pick one" and can pick the stale
+    first attempt. Silent intra-review session drift. Attempt-scoped
+    marker (`REVIEW_ID-ATTEMPT_ID`) eliminates this because every
+    launch gets a fresh ATTEMPT_ID.
   - *Write a dedicated marker file on disk (e.g.,
     `/tmp/codex-start-${REVIEW_ID}.marker`) and grep rollouts for that
     file's path.* Rejected: adds another temp-file artifact to manage
@@ -1041,6 +1055,47 @@ insufficient regardless of how narrow the window is. Positive binding
 by content (not by timing) is the correct answer; fail-closed on
 no-match is the correct default.
 
+### §6.8. 2026-04-17 (Round 7): Intra-review retry ambiguity with review-stable markers
+
+**Claim trajectory.** Round 6 (§6.7) introduced positive content-bind
+via `<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID} -->`. The live
+e2e test of that design via `codex exec` (round 2 of the dogfood
+loop) flagged a narrower but still real gap: the marker is stable
+across the whole review, not per-launch.
+
+**Reality.** SKILL.md's Step 5 explicitly allows one launch-retry
+per round on launch failure. If the first attempt leaves a rollout
+on disk (even a short-lived one that the skill considered a launch
+failure because of a missing VERDICT or empty review file), that
+rollout already contains the `${REVIEW_ID}` marker. The retry's
+fallback grep matches BOTH the first attempt's rollout AND the
+second (successful) attempt's rollout. The skill's "pick any"
+branch then silently picks either — if it picks the first
+(stale) rollout's UUID, later `codex exec resume` continues a
+dead session with content from a failed attempt. All of Step 7's
+post-resume checks would pass on that wrong session.
+
+**Root cause of the misdiagnosis.** Round 6 treated "multiple
+matches" as a `REVIEW_ID` collision (probability ~10⁻⁸) and
+recommended "pick any" as safe. It ignored that the skill's own
+retry mechanism can legitimately create duplicates without any
+randomness collision.
+
+**Mitigation.** Added per-launch `${ATTEMPT_ID}` (6-digit random)
+regenerated for the initial exec, every retry of that exec, every
+resume, and every fresh-exec fallback. Marker is now
+`${REVIEW_ID}-${ATTEMPT_ID}`, and the fallback grep requires the
+full string. A first-attempt rollout carries the OLD attempt id
+and is invisible to the retry's grep. Multi-match is now
+fail-closed (not "pick any") because under correct attempt-scoping
+it cannot legitimately happen; masking it would only hide bugs.
+
+**Lesson (augmenting §6.7).** "Unique identifier" is not enough if
+the identifier is stable across operations that can produce
+multiple on-disk artifacts. The scope of the identifier must match
+the granularity at which rollouts are created — one marker per
+rollout, one rollout per launch, one launch per marker generation.
+
 ---
 
 ## §7. Smoke test protocol
@@ -1056,9 +1111,10 @@ the repo root. Expected outputs are in comments.
 
 ```bash
 REVIEW_ID=$(date +%s)-$(printf '%08d' $RANDOM)
+ATTEMPT_ID=$(printf '%06d' $((RANDOM * RANDOM % 1000000)))
 REPO_ROOT=$(git rev-parse --show-toplevel)
 cat > /tmp/codex-prompt-${REVIEW_ID}.md <<EOF
-<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID} -->
+<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID} -->
 <role>
 You are a senior adversarial reviewer of implementation plans.
 </role>
@@ -1083,11 +1139,11 @@ head -1 /tmp/codex-stdout-${REVIEW_ID}.jsonl            # reference env: thread.
 wc -c /tmp/codex-stderr-${REVIEW_ID}.txt                # expect 0
 grep -E '^VERDICT:' /tmp/codex-review-${REVIEW_ID}.md   # expect VERDICT: APPROVED
 
-# Verify the filesystem secondary path also works (§4.1b) — positive content-bind.
-# Returns the rollout path that both postdates our prompt file AND contains the marker.
+# Verify the filesystem secondary path also works (§4.1b) — attempt-scoped content-bind.
+# Returns the rollout path that both postdates our prompt file AND contains the per-launch marker.
 find ~/.codex/sessions -name 'rollout-*.jsonl' \
   -newer /tmp/codex-prompt-${REVIEW_ID}.md \
-  -exec grep -l "ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}" {} + 2>/dev/null
+  -exec grep -l "ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID}" {} + 2>/dev/null
 # expect: exactly one path. Extract the UUID from basename — it must equal the
 # thread_id from the primary path above (if the primary was populated).
 ```
@@ -1100,19 +1156,21 @@ Continuing from §7.1 — extract the thread id and resume.
 # Primary session-id capture (may be empty in affected sandboxes)
 THREAD_ID=$(head -1 /tmp/codex-stdout-${REVIEW_ID}.jsonl \
   | grep -oE '"thread_id":"[^"]+"' | cut -d'"' -f4)
-# Secondary: positive content-bind (§4.1b). POSIX-portable.
+# Secondary: attempt-scoped content-bind (§4.1b). POSIX-portable.
 if [ -z "${THREAD_ID}" ]; then
   ROLLOUT=$(find ~/.codex/sessions -name 'rollout-*.jsonl' \
     -newer /tmp/codex-prompt-${REVIEW_ID}.md \
-    -exec grep -l "ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}" {} + 2>/dev/null \
+    -exec grep -l "ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID}" {} + 2>/dev/null \
     | head -1)
   THREAD_ID=$(basename "${ROLLOUT}" .jsonl \
     | grep -oE '[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}')
 fi
 echo "THREAD_ID=${THREAD_ID}"                           # expect a UUID
 
+# Fresh ATTEMPT_ID for the resume launch
+ATTEMPT_ID=$(printf '%06d' $((RANDOM * RANDOM % 1000000)))
 cat > /tmp/codex-resume-prompt-${REVIEW_ID}.md <<EOF
-<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID} -->
+<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID} -->
 Still there? Reply with VERDICT: APPROVED.
 EOF
 
@@ -1215,6 +1273,7 @@ If §7.1–§7.5 do not produce the expected outputs:
 | 2026-04-17 | 0.121.0 | current at time of refactor | initial author | All §2 facts verified; §7 smoke test passes end to end. Initial commit of this document. |
 | 2026-04-17 | 0.121.0 | containerized sandbox (yantar-k8s) | external agent + lead | §7.1 `- < file` form fails EXIT=1 with empty stderr. `cat \| pipe` form works for `-o` review, but `--json` stdout is empty. Filesystem secondary session-id capture (§4.1b) verified functional: UUID extracted from rollout filename successfully resumes. Not a version issue (reproduced on 0.120.0 and 0.121.0). Root cause undiagnosed — see §6.6. Skill adapted: `§4.1` now two-tier, `§4.13` switches canonical form to `cat \| pipe`. |
 | 2026-04-17 | 0.121.0 | reference env (WSL2) | live dogfood + team review | Round 6: timestamp-only secondary (§4.1b as of round 5) flagged for silent wrong-session hazard against parallel codex. Verified empirically that rollout JSONL contains prompt text (3 matches of prompt content via grep). Replaced with positive content-binding: prompt marker `<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID} -->` + `find -newer <prompt> -exec grep -l <REVIEW_ID> {} +`. All flags POSIX — GNU-find dependency of earlier §9.5 goes away. See §6.7. |
+| 2026-04-17 | 0.121.0 | reference env (WSL2) | live dogfood round 2 | Round 7: review-stable marker flagged as insufficient — SKILL.md's own launch-retry flow can leave multiple rollouts matching the same `${REVIEW_ID}`, and "pick any" reintroduces silent intra-review session drift. Fixed by adding per-launch `${ATTEMPT_ID}` (6-digit random regenerated for every exec/retry/resume/fresh-exec). Marker is now `${REVIEW_ID}-${ATTEMPT_ID}`. Multi-match changed from "pick any" to fail-closed. See §6.8. |
 
 When you re-verify (either during routine maintenance or when
 triggered by §7.7), add a row. Keep the log chronological.

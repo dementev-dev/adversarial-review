@@ -229,15 +229,20 @@ In some Claude Code sandbox configurations codex's `--json` event stream is
 suppressed when stdout is redirected to a file — the `/tmp/codex-stdout-*.jsonl`
 ends up 0 bytes even though the review itself (`-o /tmp/codex-review-*.md`)
 completes correctly. The skill handles this automatically via a filesystem
-fallback: every prompt includes a unique session marker
-(`<!-- ADVERSARIAL-REVIEW-SESSION: <REVIEW_ID> -->`) that gets written to
-the rollout JSONL on disk. When the JSONL stream is empty, the skill runs
-`find ~/.codex/sessions -name 'rollout-*.jsonl' -newer <prompt-file> -exec
-grep -l <REVIEW_ID> {} +` to positively identify this session's rollout by
-content match (not by newest-mtime, which would be unsafe against parallel
-codex invocations) and extracts the UUID from the filename. Resume continues
-to work normally. The commands used are POSIX (`find -newer`, `-exec grep -l`)
-and work identically on Linux and macOS.
+fallback: every prompt includes a **per-launch** session marker
+(`<!-- ADVERSARIAL-REVIEW-SESSION: <REVIEW_ID>-<ATTEMPT_ID> -->`) where
+`ATTEMPT_ID` is a fresh random integer regenerated for the initial exec,
+every retry, every resume, and every fresh-exec fallback. The marker is
+written to the rollout JSONL on disk. When the JSONL stream is empty, the
+skill runs `find ~/.codex/sessions -name 'rollout-*.jsonl' -newer
+<prompt-file> -exec grep -l <REVIEW_ID>-<ATTEMPT_ID> {} +` to positively
+identify this specific launch's rollout (not by newest-mtime, which would
+be unsafe against parallel codex; not by review-stable ID alone, which
+would match stale retry rollouts) and extracts the UUID from the filename.
+Zero or multiple matches → the skill fails closed with a diagnostic rather
+than silently picking. Resume continues to work normally. All commands are
+POSIX (`find -newer`, `-exec grep -l`) and work identically on Linux and
+macOS.
 
 **"NOT VERIFIED" result.**
 The skill applied fixes but the reviewer did not re-verify them (resume

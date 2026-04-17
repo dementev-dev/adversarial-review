@@ -23,7 +23,10 @@ Sends current work for adversarial review through an external AI model (OpenAI C
 
 ## Instructions
 
-> **Placeholders:** `${REVIEW_ID}`, `${CODEX_SESSION_ID}`, `${REPO_ROOT}`, and `${BASE_BRANCH}` in the steps below are template placeholders, NOT shell variables. Substitute literal values directly into each tool call. In particular, `${REPO_ROOT}` is ALWAYS an absolute path captured at Step 2; never replace it with `$(pwd)`. `${REVIEW_ID}` is also embedded verbatim in every prompt (as an HTML-style comment marker) so the filesystem session-id fallback can positively identify this session's rollout by content-match; do NOT generate a different REVIEW_ID for the marker, use the same one as for file paths.
+> **Placeholders:** `${REVIEW_ID}`, `${ATTEMPT_ID}`, `${CODEX_SESSION_ID}`, `${REPO_ROOT}`, and `${BASE_BRANCH}` in the steps below are template placeholders, NOT shell variables. Substitute literal values directly into each tool call. In particular:
+> - `${REPO_ROOT}` is ALWAYS an absolute path captured at Step 2; never replace it with `$(pwd)`.
+> - `${REVIEW_ID}` is stable for the entire review (used in file paths).
+> - `${ATTEMPT_ID}` is a fresh 6-digit random integer generated **per launch** — a new value for the initial exec, for any retry of that exec, for every resume in Step 7, and for any fresh-exec fallback. The combined marker `${REVIEW_ID}-${ATTEMPT_ID}` is embedded in the prompt (HTML comment) so the filesystem session-id fallback identifies exactly THIS launch's rollout. Do NOT reuse a prior launch's ATTEMPT_ID — that would make multiple rollouts match and reintroduce silent session drift.
 
 ### Step 1: Determine review mode
 
@@ -127,18 +130,23 @@ If all sources are empty — no changes to review, inform the user.
 
 Build the prompt depending on the mode. All prompts use the adversarial stance.
 
-**All prompts begin with a session marker.** The FIRST line of every prompt (plan, code, code-vs-plan, resume, fresh-exec fallback) must be a literal HTML-style comment:
+**All prompts begin with a per-launch session marker.** The FIRST line of every prompt (plan, code, code-vs-plan, resume, fresh-exec fallback) must be a literal HTML-style comment that includes the current `${REVIEW_ID}` AND a fresh `${ATTEMPT_ID}`:
 
 ```
-<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID} -->
+<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID} -->
 ```
 
-Substitute the actual REVIEW_ID value (e.g., `1711872000-48217593`). The comment is ignored by Codex as content but becomes part of the rollout transcript on disk, which is how the filesystem session-id fallback in check 4 positively binds a rollout file to this review (grep for the marker in rollout JSONL). Without this marker the fallback cannot distinguish this session's rollout from a parallel codex invocation.
+Example: `<!-- ADVERSARIAL-REVIEW-SESSION: 1711872000-48217593-487201 -->`.
+
+- `${REVIEW_ID}` is stable for the whole review (generated at Step 2).
+- `${ATTEMPT_ID}` is a **new** 6-digit random integer generated immediately before writing the prompt for this launch. Generate a different value for the initial exec, any retry of the initial exec, each resume in Step 7, and any fresh-exec fallback. Do NOT reuse an earlier launch's ATTEMPT_ID within the same review.
+
+The comment is ignored by Codex as content but becomes part of the rollout transcript on disk. Check 4 below positively binds the rollout to THIS launch by grepping the rollout JSONL for the exact `ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID}` string. Attempt-scoping eliminates same-review retry ambiguity (a timed-out first attempt leaves a rollout with the OLD attempt id; the retry's fallback only matches the NEW one).
 
 **Prompt for plan review:**
 
 ```
-<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID} -->
+<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID} -->
 <role>
 You are a senior adversarial reviewer of implementation plans.
 Your job is to break confidence in the plan, not to validate it.
@@ -207,7 +215,7 @@ VERDICT: REVISE
 **Prompt for code review (<= 50 files):**
 
 ```
-<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID} -->
+<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID} -->
 <role>
 You are a senior adversarial code reviewer.
 Your job is to break confidence in the change, not to validate it.
@@ -382,21 +390,21 @@ cat /tmp/codex-prompt-${REVIEW_ID}.md | timeout 600 codex exec --json \
 
    **Secondary: rollout content-match.** The primary fails for two independent reasons: (a) in some Claude Code sandbox configurations `--json` stdout is empty (0 bytes) even on exit 0 with populated `-o`; (b) partial or format-drifted output from a future codex version. In both cases the session is recoverable from disk: every `codex exec` writes a rollout file named `rollout-<ISO-timestamp>-<UUID>.jsonl` under `~/.codex/sessions/YYYY/MM/DD/` (see `DESIGN.md §2.3`). The trailing UUID in the filename is the session id — but blindly picking the newest rollout risks binding to a parallel codex invocation (silent corruption). To bind positively, the skill matches **both** (i) rollout mtime newer than the prompt file (timestamp anchor) AND (ii) rollout contains the session marker (content anchor).
 
-   Run this single POSIX-portable invocation:
+   Run this single POSIX-portable invocation, grepping for the **current launch's** `${REVIEW_ID}-${ATTEMPT_ID}` marker (not just `${REVIEW_ID}`):
 
    ```bash
-   find ~/.codex/sessions -name 'rollout-*.jsonl' -newer /tmp/codex-prompt-${REVIEW_ID}.md -exec grep -l 'ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}' {} + 2>/dev/null
+   find ~/.codex/sessions -name 'rollout-*.jsonl' -newer /tmp/codex-prompt-${REVIEW_ID}.md -exec grep -l 'ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID}' {} + 2>/dev/null
    ```
 
-   Substitute the actual REVIEW_ID value in BOTH places (the prompt file path and the grep pattern — same value). `-newer FILE` and `-exec ... {} +` are POSIX; `grep -l` is POSIX. Works identically on Linux and macOS.
+   Substitute the actual `REVIEW_ID` in the prompt path and the actual `REVIEW_ID-ATTEMPT_ID` combined marker in the grep pattern. `-newer FILE`, `-exec ... {} +`, and `grep -l` are all POSIX — works identically on Linux and macOS.
 
-   The output is zero or more rollout paths that (a) postdate our prompt file AND (b) contain our session marker. From the result:
+   The output is zero or more rollout paths that (a) postdate our prompt file AND (b) contain this launch's specific marker. From the result:
 
    - **Exactly one path** (the expected case) → this is our rollout. Extract the trailing UUID from the filename (the 36-char hex-and-dashes pattern above) and save as `CODEX_SESSION_ID`.
-   - **Zero paths** → **fail closed.** Either codex did not create a rollout, or something prevented the marker from reaching disk. We cannot safely guess — picking anything else risks binding to an unrelated session. Before aborting, surface diagnostic context to the user: the contents of `/tmp/codex-stdout-${REVIEW_ID}.jsonl` (if non-empty), `/tmp/codex-stderr-${REVIEW_ID}.txt`, and the 3 most-recent rollout filenames (`ls -t ~/.codex/sessions/*/*/*/rollout-*.jsonl 2>/dev/null | head -3`). Then treat as launch failure, retry once, then abort.
-   - **Multiple paths** (should not happen — `REVIEW_ID` collision has probability ~10⁻⁸) → pick any, proceed. If it is wrong, Step 7 resume will fail one of the three checks and route to the fallback chain.
+   - **Zero paths** → **fail closed.** Either codex did not create a rollout, or something prevented the marker from reaching disk. We cannot safely guess. Before aborting, surface diagnostic context to the user: the contents of `/tmp/codex-stdout-${REVIEW_ID}.jsonl` (if non-empty), `/tmp/codex-stderr-${REVIEW_ID}.txt`, and the 3 most-recent rollout filenames (`ls -t ~/.codex/sessions/*/*/*/rollout-*.jsonl 2>/dev/null | head -3`). Then treat as launch failure, generate a **new** `ATTEMPT_ID` for the retry (so the retry's fallback won't match this launch's rollout if it later appears), rewrite the prompt with the new marker, retry once, then abort.
+   - **Multiple paths** → **fail closed.** This should not happen: `ATTEMPT_ID` is per-launch, so two rollouts sharing both `REVIEW_ID-ATTEMPT_ID` would require either a 10⁻⁶ collision on `ATTEMPT_ID` or a mistaken reuse. Do NOT pick arbitrarily — abort the round with a diagnostic listing all matching rollout paths. Silent session drift is worse than visible failure.
 
-   **Why positive-bind instead of newest-by-mtime:** the reviewer on Round-6 flagged that picking newest-by-mtime allows a parallel codex invocation (user running codex in another terminal, CI job, etc.) to create a newer rollout during the race window, which our secondary would then silently pick — Step 7 resume would succeed against that wrong session, and the skill would apply fixes informed by an unrelated review. Positive content-match eliminates this: only rollouts containing **our** `REVIEW_ID` marker are accepted; everything else is invisible to the fallback.
+   **Why positive-bind instead of newest-by-mtime:** Round 6 of adversarial review flagged that picking newest-by-mtime allows a parallel codex invocation (user running codex in another terminal, CI job, etc.) to create a newer rollout during the race window, which our secondary would silently pick — Step 7 resume would succeed against that wrong session, and the skill would apply fixes informed by an unrelated review. Positive content-match with per-launch `ATTEMPT_ID` eliminates this both cross-review (parallel codex) and intra-review (retries): only a rollout containing **this launch's specific** marker is accepted; everything else is invisible.
 
 **Where `thread_id` / session id is NOT:**
 
@@ -474,10 +482,10 @@ Based on the reviewer's findings:
 
 **Resume is the primary path.** Saves tokens and preserves session context. A fresh `codex exec` without resume is an **emergency fallback** — costly in tokens, and requires rebuilding prior-round context.
 
-**1. Write the resume prompt** to `/tmp/codex-resume-prompt-${REVIEW_ID}.md` via **Write tool**. Use a separate file from the initial prompt so round-1 material remains available for diagnostics. The resume prompt must begin with the same session marker as the initial prompt so the filesystem fallback can positively bind this resume's rollout:
+**1. Write the resume prompt** to `/tmp/codex-resume-prompt-${REVIEW_ID}.md` via **Write tool**. Use a separate file from the initial prompt so round-1 material remains available for diagnostics. **Generate a fresh `${ATTEMPT_ID}` for this resume launch** (different from the initial exec's ATTEMPT_ID and from every prior resume's ATTEMPT_ID). The resume prompt must begin with the per-launch marker:
 
 ```
-<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID} -->
+<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID} -->
 
 I've revised based on your feedback.
 
@@ -522,7 +530,7 @@ Use `timeout: 620000` in Bash tool parameters.
 3. **Review file sanity.** Read `/tmp/codex-review-${REVIEW_ID}.md` and apply the same checks as Step 5.2:
    - Missing / empty / no `^VERDICT: (APPROVED|REVISE)$` line / REVISE without `[severity:` lines → route to fallback. Do NOT update `CODEX_SESSION_ID`.
 
-**4. Only if all three checks pass AND the verdict is REVISE** → refresh `CODEX_SESSION_ID` using two tiers (primary = first JSONL line of `/tmp/codex-stdout-${REVIEW_ID}.jsonl`; secondary = rollout file that is both newer than `/tmp/codex-resume-prompt-${REVIEW_ID}.md` AND contains the `ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}` marker, with UUID extracted from the basename — exactly the positive-binding approach from Step 4 check 4, but anchored on the resume prompt instead of the initial prompt). On APPROVED verdict, skip the refresh — there is no round N+1.
+**4. Only if all three checks pass AND the verdict is REVISE** → refresh `CODEX_SESSION_ID` using two tiers (primary = first JSONL line of `/tmp/codex-stdout-${REVIEW_ID}.jsonl`; secondary = rollout file that is both newer than `/tmp/codex-resume-prompt-${REVIEW_ID}.md` AND contains the `ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID}` marker for THIS resume's ATTEMPT_ID, with UUID extracted from the basename — same positive-binding approach as Step 4 check 4 but anchored on the resume prompt). On APPROVED verdict, skip the refresh — there is no round N+1.
 
 > **Important — NOT identical to Step 4 check 4 on the failure side.** Step 4 check 4 treats "no matching rollout" as a launch failure because in Step 4 the session id is needed for resume to even happen. In Step 7 the resume has **already succeeded** (checks 1-3 passed), and per `DESIGN.md §2.4.4` the thread id does not rotate across resumes — so if both tiers yield nothing here, **do NOT abort and do NOT retry**: keep the previous `CODEX_SESSION_ID` unchanged, log a one-line warning to the user (`"Step 7 session-id refresh: both tiers empty, continuing with previous ID per §2.4.4"`), and continue to Step 5.
 
@@ -559,10 +567,10 @@ Options:
 - Max severity `critical` or `high` → fresh exec automatically. The risk of silently skipping a serious finding outweighs the token cost.
 - Max severity `medium` only → Step 8 with the **not-verified** terminal state.
 
-**Fresh-exec prompt template.** The lead rebuilds prior-round context from the conversation (all prior rounds were shown verbatim in Step 5.3 user messages, so they are available in context). The prompt must begin with the same session marker as the initial prompt so the fallback positively binds:
+**Fresh-exec prompt template.** The lead rebuilds prior-round context from the conversation (all prior rounds were shown verbatim in Step 5.3 user messages, so they are available in context). Generate a fresh `${ATTEMPT_ID}` for this fresh-exec launch, then begin the prompt with the per-launch marker:
 
 ```
-<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID} -->
+<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID} -->
 [Original adversarial prompt for the current mode, from Step 4]
 
 ## Previous review rounds
@@ -685,8 +693,9 @@ Do NOT delete plan files that existed before the review (only temp files created
 - **`REPO_ROOT` is captured at Step 2** via `git rev-parse --show-toplevel` and substituted as an absolute literal path into every codex command. Never use `$(pwd)` inside codex commands — cwd drift between Bash calls makes it unreliable.
 - **Resume requires `cd '${REPO_ROOT}' && ...`** because `codex exec resume` has no `-C` flag; cwd is inherited from the shell. The initial exec uses `-C "${REPO_ROOT}"` instead.
 - **`CODEX_SESSION_ID` is updated only on full success** — ALL of (exit=0 AND stderr has no `Error:`/`thread/resume failed` line AND review file contains a valid `VERDICT:` line with findings on REVISE). On any failure, leave it unchanged and route to the fallback.
-- **Session ID capture is two-tier.** Primary: `thread_id` from the first JSONL line of stdout. Secondary (primary empty / malformed / missing `thread_id`): the rollout file that is both `-newer` than the prompt file AND contains the `ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}` marker, with UUID from the filename. Positive content-binding eliminates the wrong-session hazard from parallel codex invocations: only our session's rollout matches the grep, everything else is invisible.
-- **Every prompt sent to codex starts with `<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID} -->` as its first line.** This applies to initial, resume, and fresh-exec fallback prompts alike. The marker is how the filesystem session-id fallback distinguishes our rollout from a parallel codex invocation; dropping the marker breaks positive-binding and reopens the silent-corruption risk.
+- **Session ID capture is two-tier.** Primary: `thread_id` from the first JSONL line of stdout. Secondary (primary empty / malformed / missing `thread_id`): the rollout file that is both `-newer` than the prompt file AND contains the `ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID}` marker for THIS launch, with UUID from the filename. Positive content-binding eliminates wrong-session hazard from both parallel codex invocations AND same-review retries.
+- **Every prompt starts with `<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID} -->` as its first line.** Generate a **fresh 6-digit ATTEMPT_ID per launch** (initial exec, any retry of that exec, each resume in Step 7, any fresh-exec fallback). Never reuse an ATTEMPT_ID within the same review — doing so would let a prior attempt's rollout match the current launch's grep, reintroducing session drift.
+- **Secondary-path multi-match is fail-closed, not pick-any.** If the `find ... -exec grep -l ... {} +` returns two or more rollout paths for a single `${REVIEW_ID}-${ATTEMPT_ID}`, abort the round with a diagnostic. This should not happen under correct attempt-scoping; if it does, something is structurally wrong and silent picking would mask it.
 - **Prompt delivery is `cat file | codex exec ... -`.** The `- < file` stdin-redirect form is accepted by codex but exits 1 with empty stderr in some Claude Code sandbox configurations. Pipe is portable across both envs observed.
 - **The `--json` stdout stream is never human-readable review text** — JSONL events when populated, empty when suppressed by sandbox. Never treat Bash result as review content; the review lives exclusively in `/tmp/codex-review-*.md`.
 - **Launch-failure retry** is capped at 1 per round and does NOT consume the 5-round counter. The retry counter is per-round; it resets at the start of every new round and is tracked only in that round's reasoning.
