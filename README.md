@@ -105,17 +105,21 @@ chosen config file:
 
 ```jsonc
 // --- adversarial-review permissions ---
-// Git: diff, status, branch detection
+// Git: diff, status, branch detection, repo root, submodule check
 "Bash(git diff*)",
 "Bash(git status*)",
 "Bash(git symbolic-ref*)",
 "Bash(git rev-parse*)",
-// Codex: review execution (always wrapped in timeout)
+// Codex: initial launch (uses -C; no cd prefix needed)
 "Bash(timeout 600 codex exec *)",
-// Temp files: prompts, plans, output capture
+// Codex: resume (needs cd prefix to REPO_ROOT because resume has no -C flag)
+"Bash(cd * && timeout 600 codex exec resume *)",
+// Temp files: prompts (initial + resume), plans, review output, JSONL stdout, stderr
 "Write(/tmp/codex-plan-*)",
 "Write(/tmp/codex-prompt-*)",
+"Write(/tmp/codex-resume-prompt-*)",
 "Read(/tmp/codex-review-*)",
+"Read(/tmp/codex-stdout-*)",
 "Read(/tmp/codex-stderr-*)",
 // Cleanup and output piping
 "Bash(rm -f /tmp/codex-*)",
@@ -135,9 +139,12 @@ chosen config file:
       "Bash(git symbolic-ref*)",
       "Bash(git rev-parse*)",
       "Bash(timeout 600 codex exec *)",
+      "Bash(cd * && timeout 600 codex exec resume *)",
       "Write(/tmp/codex-plan-*)",
       "Write(/tmp/codex-prompt-*)",
+      "Write(/tmp/codex-resume-prompt-*)",
       "Read(/tmp/codex-review-*)",
+      "Read(/tmp/codex-stdout-*)",
       "Read(/tmp/codex-stderr-*)",
       "Bash(rm -f /tmp/codex-*)",
       "Bash(tee *)"
@@ -200,9 +207,27 @@ exit code 124, the reviewer did not respond in time. Retry — this is usually
 transient.
 
 **Resume fails with session error.**
-The skill uses `codex exec resume <session-id>` for rounds 2+. If the session
-expired or the ID was not captured, the skill falls back to a fresh `codex exec`
-automatically. No action needed.
+The skill uses `codex exec resume <session-id>` for rounds 2+. On failure
+(non-zero exit, `thread/resume failed` in stderr, or a malformed review),
+the skill does NOT silently fall back. In an interactive session it asks
+whether to run a fresh `codex exec` (higher token cost) or conclude the
+review as NOT VERIFIED. In headless runs it decides based on the maximum
+severity of the last successful round's findings: critical/high → fresh
+exec; medium-only → conclude as NOT VERIFIED.
+
+**"NOT VERIFIED" result.**
+The skill applied fixes but the reviewer did not re-verify them (resume
+failed or the operator chose to conclude). This is not an approval —
+manually review the applied fixes before merging.
+
+**Running inside a git submodule.**
+`git rev-parse --show-toplevel` returns the submodule path, not the parent
+repo. The skill warns you and scopes the review to the submodule. If you
+meant to review the parent, invoke the skill from the parent working tree.
+
+**Bare repository or not inside a work tree.**
+The skill aborts at Step 2 with a clear message. Run it from inside a
+git working tree.
 
 **Plan Mode exits when writing temp files.**
 In Claude Code Plan Mode, writing to `/tmp` may trigger a permission prompt
@@ -215,6 +240,15 @@ review correctness.
   a permission prompt or cause Plan Mode to exit. Does not affect review correctness.
 - **`resume` inherits sandbox.** `codex exec resume` does not accept `-s` —
   sandbox is inherited from the original session (always `read-only`).
+- **`resume` has no `-C` flag.** The skill captures `REPO_ROOT` via
+  `git rev-parse --show-toplevel` at Step 2 and prefixes every resume with
+  `cd '<REPO_ROOT>' && ...`. This requires paths without single quotes;
+  pathological paths (containing `'`, `"`, `$`, backtick, newline) cause
+  the skill to abort at Step 2.
+- **Submodule scoping.** When invoked inside a submodule, the review is
+  scoped to the submodule — `git rev-parse --show-toplevel` does not walk
+  up to the parent. A warning is printed; invoke from the parent repo if
+  you want parent scope.
 
 ## Roadmap
 

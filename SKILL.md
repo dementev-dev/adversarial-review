@@ -23,7 +23,7 @@ Sends current work for adversarial review through an external AI model (OpenAI C
 
 ## Instructions
 
-> **Placeholders:** `${REVIEW_ID}`, `${CODEX_SESSION_ID}` and `${BASE_BRANCH}` in the steps below are template placeholders, NOT shell variables. Substitute literal values directly into each tool call.
+> **Placeholders:** `${REVIEW_ID}`, `${CODEX_SESSION_ID}`, `${REPO_ROOT}`, and `${BASE_BRANCH}` in the steps below are template placeholders, NOT shell variables. Substitute literal values directly into each tool call. In particular, `${REPO_ROOT}` is ALWAYS an absolute path captured at Step 2; never replace it with `$(pwd)`.
 
 ### Step 1: Determine review mode
 
@@ -49,10 +49,28 @@ Determine what to review. Check in priority order:
 | Yes | No | **code** — review code changes |
 | No | No | Ask the user what to review |
 
-### Step 2: Generate Session ID and determine base branch
+### Step 2: Generate Session ID, capture REPO_ROOT, determine base branch
 
-Generate a unique `REVIEW_ID` yourself, format: `{unix_timestamp}-{random_4digit_number}`.
-Example: `1711872000-4821`. **Do NOT use bash** — substitute the value directly into commands in the following steps.
+**REVIEW_ID:** generate yourself, format `{unix_timestamp}-{random_8digit_number}`.
+Example: `1711872000-48217593`. **Do NOT use bash** — substitute the value directly into commands in the following steps. 8-digit random makes collisions negligible (1 in 10^8 per same-second invocation).
+
+**Capture REPO_ROOT:**
+
+```bash
+git rev-parse --show-toplevel
+```
+
+- **Exit 0, non-empty output** → absolute path. Save literally as `REPO_ROOT` (a template placeholder — substitute verbatim into codex commands; do NOT use `$(pwd)` anywhere).
+- **Exit 128** (bare repo, or not in a work tree) → tell the user: `Cannot run adversarial review — current directory is not inside a git working tree.` Abort the skill.
+- **Path contains single quote, double quote, `$`, backtick, newline** → tell the user: `REPO_ROOT path contains shell-special characters; cannot safely construct codex commands.` Abort.
+
+**Submodule warning:** after capturing REPO_ROOT, run:
+
+```bash
+git rev-parse --show-superproject-working-tree
+```
+
+If this returns non-empty, the user is inside a git submodule. Tell the user: `You are inside a submodule. The review will be scoped to this submodule (${REPO_ROOT}), not the parent repo. If you meant to review the parent, invoke from there.` Proceed — this is a warning, not an abort.
 
 **Determining base branch (only for `code` and `code-vs-plan` modes):**
 
@@ -290,59 +308,111 @@ And the following items are added to `<attack_surface>`:
 **Launching Codex — command template:**
 
 Flags:
+- `--json` — stdout becomes JSONL events; **required** for deterministic session-ID capture
 - `-m gpt-5.4` — model (overridden by `model:...` argument)
 - `-c model_reasoning_effort=high` — reasoning depth (overridden by `xhigh`, `low`, etc.)
 - `-s read-only` — reviewer only reads, does not write
-- `-o /tmp/codex-review-${REVIEW_ID}.md` — file for capturing output
+- `-C "${REPO_ROOT}"` — pin codex workdir to absolute repo root
+- `-o /tmp/codex-review-${REVIEW_ID}.md` — file for capturing final agent text
 
 **Prompt delivery:** write the prompt to `/tmp/codex-prompt-${REVIEW_ID}.md` via **Write tool**, then pass via stdin redirection (`- < file`). This avoids shell quoting issues with long XML prompts.
 
 **Plan Mode note:** Writing to `/tmp` via Write tool may trigger a permission prompt or exit Plan Mode. This is a known Claude Code limitation — Plan Mode restricts edits to the plan file only. If this happens, it does not affect review correctness: the review mode is already determined, and the skill only edits the plan file and `/tmp` temp files.
 
 ```bash
-timeout 600 codex exec \
+timeout 600 codex exec --json \
   -m gpt-5.4 \
   -c model_reasoning_effort=high \
   -s read-only \
+  -C "${REPO_ROOT}" \
   -o /tmp/codex-review-${REVIEW_ID}.md \
   - < /tmp/codex-prompt-${REVIEW_ID}.md \
+  > /tmp/codex-stdout-${REVIEW_ID}.jsonl \
   2>/tmp/codex-stderr-${REVIEW_ID}.txt
 ```
+
+> **CRITICAL — the Bash tool result is NOT the review.** With `--json`, stdout is a machine-readable JSONL event stream (thread.started, turn.started, item.completed, turn.completed). It is not human-readable. The human-readable review exists ONLY in `/tmp/codex-review-${REVIEW_ID}.md`. Do not attempt to extract review text from the Bash result — there is none.
 
 **Important:**
 - Always wrap `codex exec` in `timeout 600` (10 minutes). If Codex hangs — the command exits with code 124.
 - Use `timeout: 620000` parameter in Bash tool for headroom.
-- The command is **synchronous**: when it returns, the `-o` file is ready. Do **NOT** use a poll-loop (`while/sleep`).
-- If exit code = 124 (timeout) — inform the user and offer to retry.
-- stderr is redirected to a temp file for session ID capture and error diagnostics.
+- The command is **synchronous**: when it returns, all four files (`-o`, stdout jsonl, stderr, prompt) are in their final state. Do **NOT** use a poll-loop.
+- With `--json`, stderr is empty on success. It contains content only on errors (e.g. "Failed to write last message file ..."). Use stderr for diagnostics, NOT for session-id capture.
 
-**After launch:** extract the session ID from the stderr file using **Read tool** on `/tmp/codex-stderr-${REVIEW_ID}.txt`. Find the line `session id: <uuid>` (format: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) and extract the UUID value.
+**Post-launch strict check order (do each before moving to the next):**
 
-Save the result as `CODEX_SESSION_ID` — needed for `resume` in subsequent rounds. If the session ID is not found or does not match UUID format — resume will not work (fallback to fresh exec).
+1. **Exit code.**
+   - `124` → timeout. Tell the user "Reviewer did not respond within 10 minutes" and offer retry. Retry does NOT consume the round counter; max 1 retry per round.
+   - `≠ 0 and ≠ 124` → launch error. Read `/tmp/codex-stderr-${REVIEW_ID}.txt` (if it exists), show its contents to the user, abort the skill.
+   - `0` → proceed.
+
+2. **Stderr sanity (even on exit 0).** Read `/tmp/codex-stderr-${REVIEW_ID}.txt`.
+   - If file missing → redirect itself failed; tell user `Could not create stderr file — check /tmp writability`, abort.
+   - If file contains a line matching `^Error:` or `Failed to write` → codex reported an infrastructure failure despite exit 0. Show stderr to user, route to launch-failure retry (max 1 per round; after retry failure → hard abort).
+   - Otherwise → proceed.
+
+3. **Capture `CODEX_SESSION_ID` from JSONL stdout.** Read `/tmp/codex-stdout-${REVIEW_ID}.jsonl`. First line format:
+   ```json
+   {"type":"thread.started","thread_id":"<uuid>","...":...}
+   ```
+   Parse the first line as JSON and extract `thread_id`. Save as `CODEX_SESSION_ID`.
+   - If the first line is not valid JSON or has no `thread_id` → treat as launch failure; show stderr, retry once, then abort.
+
+4. **Review file sanity.** (Performed again in Step 5, but note upfront.) `/tmp/codex-review-${REVIEW_ID}.md` must exist and contain a line matching `^VERDICT: (APPROVED|REVISE)$`. If not → Step 5 will handle it via retry/abort.
+
+**Where `thread_id` / session id is NOT:**
+
+- NOT in `/tmp/codex-review-${REVIEW_ID}.md` (only contains the final agent text)
+- NOT in stderr file under `--json` (empty on success; error text only on failure)
+- NOT in the middle or tail of stdout — only the **first line** of the JSONL file
 
 **Notes:**
 - Default model: `gpt-5.4` with `model_reasoning_effort=high`. User can override via arguments.
 - Always `-s read-only` — reviewer must not write files.
-- `-o` captures model output to file. Session ID goes to stderr (captured separately). Do **NOT** run in background.
+- Do **NOT** run in background.
 
-### Step 5: Read the review and check the verdict
+### Step 5: Read the review, show it, then check the verdict
 
-1. Read `/tmp/codex-review-${REVIEW_ID}.md`
-2. Show the user **verbatim** — do not rephrase the reviewer's findings:
+**1. Read the review file.** Read `/tmp/codex-review-${REVIEW_ID}.md`.
+
+**2. Semantic sanity checks.** The file MUST pass all of these:
+
+- Exists and is non-empty.
+- Contains a line exactly matching `^VERDICT: (APPROVED|REVISE)$`.
+- If verdict is `REVISE` → file must also contain at least one line matching `\[severity:\s*(critical|high|medium)` (i.e. at least one structured finding).
+
+If any check fails → this is a **launch failure** (model produced no actionable review):
+
+- Show the user the `/tmp/codex-stderr-${REVIEW_ID}.txt` contents (if any) AND the raw review file.
+- Offer ONE retry of Step 4 (re-launch the same round). Retry does NOT consume the round counter — the round counter advances only when a valid review is produced.
+- Track the retry counter in your **current round's** reasoning only. The counter resets at the start of every new round.
+- After a failed retry → hard abort the skill. Do NOT route to the Step 7 fresh-exec fallback (that path is for resume failures in rounds 2+, and depends on prior-round content).
+
+**3. Show the review to the user. This is mandatory and blocking.**
+
+> Your VERY NEXT MESSAGE to the user must begin with the header below, followed by the file contents **verbatim**. Not "I've received the review", not "The reviewer said:", not a summary — the literal file content.
+>
+> Do NOT wrap the review in a code fence (the review is already markdown, and an outer fence would break on inner fences).
+>
+> Do NOT call any Edit, Write, or fix-applying tool in the same message as the review. The review output is a standalone user-visible message.
+
+Message format:
 
 ```
 ## Adversarial Review — Round N (mode: <plan|code|code-vs-plan>, model: gpt-5.4)
 
-[Reviewer's response — verbatim]
+<verbatim contents of /tmp/codex-review-${REVIEW_ID}.md>
 ```
 
-3. Check the verdict:
-   - **VERDICT: APPROVED** → proceed to Step 8 (Done)
-   - **VERDICT: REVISE** → proceed to Step 6 (Fixes)
-   - No clear verdict → treat as parse failure, run resume/fallback requesting a clear verdict
-   - Maximum reached (5 rounds) → proceed to Step 8 with a note
+**4. Only AFTER the review message has been sent** — parse the VERDICT line and dispatch:
+
+- `VERDICT: APPROVED` → Step 8 (Done).
+- `VERDICT: REVISE` → Step 6 (Fixes).
+- Maximum rounds reached (5 rounds) → Step 8 with the max-rounds note.
 
 ### Step 6: Apply fixes
+
+> **Precondition gate (check first).** Before calling any Edit, Write, or other fix-applying tool: confirm that you have already sent a user-visible message in THIS round whose body contains the verbatim review text. If you have not — STOP. Go back to Step 5 and send the review message now. This is the same rule that protects the "user sees the review" contract; a literal reader may otherwise slip past it.
 
 Based on the reviewer's findings:
 
@@ -364,9 +434,9 @@ Based on the reviewer's findings:
 
 ### Step 7: Resubmit to Codex (Rounds 2-5)
 
-**Resume is the primary path.** Saves tokens and preserves session context. A fresh `codex exec` without resume is an **emergency fallback** that costs significantly more tokens. Use only if resume fails.
+**Resume is the primary path.** Saves tokens and preserves session context. A fresh `codex exec` without resume is an **emergency fallback** — costly in tokens, and requires rebuilding prior-round context.
 
-1. Write the resume prompt to `/tmp/codex-prompt-${REVIEW_ID}.md` via **Write tool** (overwrite previous prompt):
+**1. Write the resume prompt** to `/tmp/codex-resume-prompt-${REVIEW_ID}.md` via **Write tool**. Use a separate file from the initial prompt so round-1 material remains available for diagnostics.
 
 ```
 I've revised based on your feedback.
@@ -381,33 +451,103 @@ Re-review with the same adversarial stance. Focus on:
 End with VERDICT: APPROVED or VERDICT: REVISE
 ```
 
-2. Run resume via stdin redirection:
+**2. Run resume.** Resume does NOT accept `-C`, so prefix the command with an explicit `cd` to `${REPO_ROOT}` (captured at Step 2). Use single quotes around `${REPO_ROOT}` — the path was validated at Step 2 to contain no single quotes.
 
 ```bash
-timeout 600 codex exec resume ${CODEX_SESSION_ID} \
-  - < /tmp/codex-prompt-${REVIEW_ID}.md \
+cd '${REPO_ROOT}' && timeout 600 codex exec resume --json \
+  ${CODEX_SESSION_ID} \
+  -o /tmp/codex-review-${REVIEW_ID}.md \
+  - < /tmp/codex-resume-prompt-${REVIEW_ID}.md \
+  > /tmp/codex-stdout-${REVIEW_ID}.jsonl \
   2>/tmp/codex-stderr-${REVIEW_ID}.txt
 ```
 
 Use `timeout: 620000` in Bash tool parameters.
 
-**Note:** `resume` does not accept `-s` (sandbox) — sandbox is inherited from the original session. Do not pass `-s` to resume. The `-m` (model) flag is accepted if you need to override the model.
+**Note:** Resume does NOT accept `-s` (sandbox — inherited from the original session; always `read-only` here) or `-C` (see above). It DOES accept `--json`, `-o`, `-m`, and `-i`.
 
-stderr is redirected to temp file for diagnostics. On resume failure, check `/tmp/codex-stderr-${REVIEW_ID}.txt` for details.
+**3. Post-resume strict check order (do each before moving to the next):**
 
-3. Check the result by exit code:
-   - **exit 0** — success. stdout contains clean review. Show to user directly (Write to file and Read are **not needed**). Check VERDICT: the last non-empty line of stdout = `VERDICT: APPROVED` or `VERDICT: REVISE`. If verdict is missing → output may have been truncated, proceed to Fallback. Then apply verdict handling from Step 5 (APPROVED → Step 8, REVISE → Step 6).
-   - **exit 124** — timeout. Tell the user: "Reviewer did not respond within 10 minutes" and offer to retry.
-   - **other exit code** — tell the user: "Resume failed (exit code N)". Proceed to Fallback. Check `/tmp/codex-stderr-${REVIEW_ID}.txt` for diagnostics.
+1. **Exit code.**
+   - `124` → timeout. Tell the user and offer retry. Retry does not consume the round counter.
+   - `≠ 0` → resume failed. Do NOT update `CODEX_SESSION_ID`. Route to fallback.
+   - `0` → proceed.
 
-**Fallback** — if `resume` did not work (session expired, session ID not captured, error):
+2. **Stderr error check** (exit 0 can hide `Error:` or `thread/resume failed`). Read `/tmp/codex-stderr-${REVIEW_ID}.txt`:
+   - If file is missing → redirect failed; tell user `/tmp not writable`, abort.
+   - If contains a line matching `thread/resume failed` or `^Error:` → route to fallback. Do NOT update `CODEX_SESSION_ID`.
 
-1. Collect the list of changed files (same as Step 3).
-2. Write the fallback prompt (with description of previous rounds) to `/tmp/codex-prompt-${REVIEW_ID}.md`.
-3. Launch a fresh `codex exec` using the **same command template as Step 4** (stdin via `- < file`, stderr to temp file, `-o` for output).
-4. **Extract the new session ID** from `/tmp/codex-stderr-${REVIEW_ID}.txt` and **refresh `CODEX_SESSION_ID`** — otherwise subsequent resume attempts will use the stale session ID.
+3. **Review file sanity.** Read `/tmp/codex-review-${REVIEW_ID}.md` and apply the same checks as Step 5.2:
+   - Missing / empty / no `^VERDICT: (APPROVED|REVISE)$` line / REVISE without `[severity:` lines → route to fallback. Do NOT update `CODEX_SESSION_ID`.
 
-Return to **Step 5**.
+**4. Only if all three checks pass** → update `CODEX_SESSION_ID` from the first JSONL line of `/tmp/codex-stdout-${REVIEW_ID}.jsonl`. Each successful resume rotates the thread id; subsequent resumes MUST use the new id.
+
+After updating `CODEX_SESSION_ID`, return to **Step 5** with the new review.
+
+---
+
+**Fallback chain** — triggered when any of the three resume checks above fails.
+
+> `--last` is deliberately NOT used. `codex exec resume --last` picks the newest session in the current cwd, which may be an unrelated codex invocation and cannot be distinguished from the intended one until after damage is done.
+
+**Severity classification** — parse the **previous** round's review file (which is still in `/tmp/codex-review-${REVIEW_ID}.md` only if the resume overwrote the current-round result but not the previous-round; in general, rely on **conversation history** where prior rounds were shown verbatim per Step 5.3).
+
+Parse case-insensitively for `\[severity:\s*(critical|high|medium)\b` and take the highest. If zero matches (reviewer format drift), default to `critical` to force re-verification in non-interactive mode.
+
+**Interactive mode** (you received a direct user message earlier in this session, not a trigger/cron):
+
+Ask the user:
+
+```
+Resume failed — the reviewer's re-review did not produce a usable result.
+Last round's maximum severity: <level>.
+
+Options:
+(a) Run a fresh `codex exec` with full previous-rounds context (higher token cost, new session)
+(b) Conclude the review — show current findings as NOT VERIFIED
+```
+
+- (a) → fresh-exec path below.
+- (b) → Step 8 with the **not-verified** terminal state (same as maximum-reached, but with a different header).
+
+**Non-interactive mode** (headless, scheduled run, no direct user message in this conversation):
+
+- Max severity `critical` or `high` → fresh exec automatically. The risk of silently skipping a serious finding outweighs the token cost.
+- Max severity `medium` only → Step 8 with the **not-verified** terminal state.
+
+**Fresh-exec prompt template.** The lead rebuilds prior-round context from the conversation (all prior rounds were shown verbatim in Step 5.3 user messages, so they are available in context):
+
+```
+[Original adversarial prompt for the current mode, from Step 4]
+
+## Previous review rounds
+
+### Round 1 findings (verbatim from earlier in this conversation):
+<copy the round-1 review text that you already output as a user message>
+
+### Round 1 fixes:
+<copy the round-1 fixes list you output in Step 6>
+
+### Round 2 findings (verbatim):
+<...>
+
+### Round 2 fixes:
+<...>
+
+## Current state of the artifact
+[plan mode] Full current plan text: <insert>
+[code mode] Run `git diff` from ${REPO_ROOT} to see the current changes.
+
+Re-review. Focus on whether prior fixes resolved the reported issues and on any NEW issues introduced by the fixes.
+
+End with VERDICT: APPROVED or VERDICT: REVISE.
+```
+
+Write this prompt to `/tmp/codex-prompt-${REVIEW_ID}.md` (overwriting the original is acceptable here; diagnostic files for the failed resume remain in `/tmp/codex-stderr-*` and `/tmp/codex-stdout-*`).
+
+Launch using the **same command template as Step 4** (with `--json`, `-C`, `-o`, stdin, stdout jsonl, stderr), apply the same post-launch strict check order, capture a fresh `CODEX_SESSION_ID`, then return to **Step 5**.
+
+> This fresh exec consumes one round from the 5-round counter — same as a successful resume would have.
 
 ### Step 8: Final result
 
@@ -436,32 +576,67 @@ Return to **Step 5**.
 **The reviewer still has findings. Please review them and decide how to proceed.**
 ```
 
-### Step 9: Cleanup
+**Not verified** (resume failed and the operator chose to conclude, or headless with only medium severity):
+```
+## Adversarial Review — Summary (mode: <mode>, model: gpt-5.4)
 
-**In Claude Code Plan Mode:** skip all cleanup (including deferred). rm will trigger a permission prompt. Files will be cleaned up on the next invocation outside Plan Mode.
+**Status:** NOT VERIFIED — fixes applied, reviewer did not re-verify
 
-**Outside Plan Mode:**
+**Last round's findings:**
+[Verbatim findings from the last successful round]
 
-```bash
-rm -f /tmp/codex-prompt-${REVIEW_ID}.md /tmp/codex-review-${REVIEW_ID}.md \
-      /tmp/codex-stderr-${REVIEW_ID}.txt /tmp/codex-plan-${REVIEW_ID}.md
+**Applied fixes:**
+[List of fixes per finding]
+
+---
+**WARNING: This is NOT an approval. Fixes were applied but never verified by the reviewer. Manual review is required before merging.**
 ```
 
-If the user declined rm — continue without error.
+### Step 9: Cleanup
 
-Do NOT delete plan files that existed before the review (only temp files created by this skill). Old temp files from previous sessions are harmless in /tmp and will be cleaned up by the OS on reboot.
+**Conditional on terminal state:**
+
+| Terminal state | Cleanup behavior |
+|---|---|
+| Approved | Remove all temp files |
+| Maximum rounds reached | Remove all temp files |
+| Not verified (fallback conclude) | Remove all temp files |
+| Aborted (launch failure, redirect failure, infrastructure error) | **LEAVE files in place** for diagnostics |
+
+**In Claude Code Plan Mode:** skip all cleanup (including deferred). `rm` will trigger a permission prompt. Files will be cleaned up on the next invocation outside Plan Mode.
+
+**Outside Plan Mode, on a cleanup-eligible terminal state:**
+
+```bash
+rm -f /tmp/codex-plan-${REVIEW_ID}.md \
+      /tmp/codex-prompt-${REVIEW_ID}.md \
+      /tmp/codex-resume-prompt-${REVIEW_ID}.md \
+      /tmp/codex-review-${REVIEW_ID}.md \
+      /tmp/codex-stdout-${REVIEW_ID}.jsonl \
+      /tmp/codex-stderr-${REVIEW_ID}.txt
+```
+
+If the user declined `rm` — continue without error.
+
+Do NOT delete plan files that existed before the review (only temp files created by this skill). On abort paths, old temp files remain for diagnostics and will be cleaned up by the OS on reboot, or overwritten by the next invocation using the same REVIEW_ID (collision probability is ~10⁻⁸ per same-second run).
 
 ## Rules
 
-- Claude **actively fixes** issues based on reviewer feedback — this is NOT just message forwarding
-- Reviewer findings are shown **verbatim** — do not rephrase or shorten
-- Auto-detect review mode from context; user arguments take priority
-- With explicit `plan` argument or in Claude Code Plan Mode: skip git checks and base branch detection
-- Resume is the primary path for subsequent rounds. Fresh exec is an emergency fallback (expensive in tokens)
-- Cleanup is best-effort: skip in Plan Mode, continue without error if declined
-- Prefer existing files, do not create unnecessary copies
-- Always read-only sandbox — reviewer never writes files
-- Maximum 5 rounds to protect against infinite loops
-- Show the user reviews and fixes for each round
-- If Codex CLI is not installed or crashed — tell the user: `npm install -g @openai/codex`
-- If a fix contradicts the user's explicit requirements — skip and explain why
+- Claude **actively fixes** issues based on reviewer feedback — this is NOT just message forwarding.
+- Reviewer findings are shown **verbatim** — do not rephrase or shorten. The Step 5 "YOUR NEXT MESSAGE" instruction is blocking: no edit/fix tool may be called until that message has been sent.
+- Auto-detect review mode from context; user arguments take priority.
+- With explicit `plan` argument or in Claude Code Plan Mode: skip git checks and base branch detection.
+- **`REPO_ROOT` is captured at Step 2** via `git rev-parse --show-toplevel` and substituted as an absolute literal path into every codex command. Never use `$(pwd)` inside codex commands — cwd drift between Bash calls makes it unreliable.
+- **Resume requires `cd '${REPO_ROOT}' && ...`** because `codex exec resume` has no `-C` flag; cwd is inherited from the shell. The initial exec uses `-C "${REPO_ROOT}"` instead.
+- **`CODEX_SESSION_ID` is updated only on full success** — ALL of (exit=0 AND stderr has no `Error:`/`thread/resume failed` line AND review file contains a valid `VERDICT:` line with findings on REVISE). On any failure, leave it unchanged and route to the fallback.
+- **The `--json` stdout stream is machine-readable JSONL only.** The human review exists exclusively in `/tmp/codex-review-*.md`. Never treat Bash result as review content.
+- **Launch-failure retry** is capped at 1 per round and does NOT consume the 5-round counter. The retry counter is per-round; it resets at the start of every new round and is tracked only in that round's reasoning.
+- **Resume is the primary path for rounds 2-5.** Fresh exec is a fallback that runs only when resume fails; it consumes one round from the counter just as a successful resume would.
+- **`--last` is never used** — cwd filtering is insufficient to distinguish the current skill session from unrelated parallel codex invocations in the same repo.
+- **Fallback after resume failure:** interactive → ask the user (fresh exec vs conclude as not-verified); non-interactive → auto fresh exec if max severity is critical/high, auto conclude-as-not-verified if only medium.
+- Cleanup is **conditional on terminal state**: remove temp files on approved/max-reached/not-verified; LEAVE them on abort (diagnostic value). Skip all cleanup in Plan Mode.
+- Always read-only sandbox — reviewer never writes files.
+- Maximum 5 rounds to protect against infinite loops.
+- Show the user reviews and fixes for each round.
+- If Codex CLI is not installed or crashed — tell the user: `npm install -g @openai/codex`.
+- If a fix contradicts the user's explicit requirements — skip and explain why.
