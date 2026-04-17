@@ -110,8 +110,6 @@ chosen config file:
 "Bash(git status*)",
 "Bash(git symbolic-ref*)",
 "Bash(git rev-parse*)",
-// Pre-exec timestamp capture (for session-id filesystem fallback)
-"Bash(date +%s)",
 // Codex: initial launch (uses -C; prompt fed via cat | pipe for env portability)
 "Bash(cat /tmp/codex-prompt-* | timeout 600 codex exec *)",
 // Codex: resume (cd prefix because resume has no -C flag; prompt via cat | pipe)
@@ -127,6 +125,9 @@ chosen config file:
 "Read(/tmp/codex-review-*)",
 "Read(/tmp/codex-stdout-*)",
 "Read(/tmp/codex-stderr-*)",
+// Archive failed-resume diagnostics before fresh exec overwrites them
+"Bash(mv /tmp/codex-stdout-* /tmp/codex-stdout-*-failed-resume.jsonl)",
+"Bash(mv /tmp/codex-stderr-* /tmp/codex-stderr-*-failed-resume.txt)",
 // Cleanup
 "Bash(rm -f /tmp/codex-*)"
 ```
@@ -143,7 +144,6 @@ chosen config file:
       "Bash(git status*)",
       "Bash(git symbolic-ref*)",
       "Bash(git rev-parse*)",
-      "Bash(date +%s)",
       "Bash(cat /tmp/codex-prompt-* | timeout 600 codex exec *)",
       "Bash(cd * && cat /tmp/codex-resume-prompt-* | timeout 600 codex exec resume *)",
       "Bash(find ~/.codex/sessions*)",
@@ -154,6 +154,8 @@ chosen config file:
       "Read(/tmp/codex-review-*)",
       "Read(/tmp/codex-stdout-*)",
       "Read(/tmp/codex-stderr-*)",
+      "Bash(mv /tmp/codex-stdout-* /tmp/codex-stdout-*-failed-resume.jsonl)",
+      "Bash(mv /tmp/codex-stderr-* /tmp/codex-stderr-*-failed-resume.txt)",
       "Bash(rm -f /tmp/codex-*)"
     ]
   }

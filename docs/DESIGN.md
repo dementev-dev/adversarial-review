@@ -484,12 +484,14 @@ Each decision below follows the same template:
     only) — load-bearing for `§4.9`.
   - Secondary path introduces a filesystem race against parallel
     codex invocations (§9.1 scope). Mitigated (not eliminated) by
-    the pre-exec timestamp (`CODEX_SESSIONS_BEFORE=$(($(date +%s) -
-    1))`) narrowing the window to "files created within ~1-2 seconds
-    of the exec start". The `-1` shift against `-newermt`'s strict-
-    greater semantics prevents same-epoch miss; the race window is
-    one second wider as a result, still negligible compared to a
-    real codex exec duration.
+    the pre-exec timestamp `CODEX_SESSIONS_BEFORE` (computed by the
+    lead in-reasoning as "current Unix timestamp minus 1" and
+    substituted as a literal integer — no Bash call), narrowing the
+    window to "files created within ~1-2 seconds of the exec start".
+    The `-1` shift against `-newermt`'s strict-greater semantics
+    prevents same-epoch miss; the race window is one second wider as
+    a result, still negligible compared to a real codex exec
+    duration.
   - Session-id capture happens only after review-file sanity passes
     AND only when verdict is `REVISE` (Step 4 check order in
     `SKILL.md`). This avoids aborting a valid round-1 APPROVED over
@@ -1204,7 +1206,7 @@ and `-printf`, both GNU extensions. On macOS (BSD `find`) the commands
 do not accept these flags. The skill does not detect the platform and
 does not translate commands automatically.
 
-Mitigation today: `SKILL.md` Step 4 check 3 includes a one-paragraph
+Mitigation today: `SKILL.md` Step 4 check 4 includes a one-paragraph
 platform note that states the *goal* of the command ("list rollout
 files modified since `CODEX_SESSIONS_BEFORE`, pick newest, extract
 UUID from filename") and invites the operator or the lead to substitute
