@@ -145,13 +145,29 @@ codex exec [OPTIONS] [PROMPT]
 codex exec resume [OPTIONS] [SESSION_ID] [PROMPT]
 ```
 
-Both accept PROMPT either as a trailing argument or as stdin (pass `-`
-as the PROMPT argument, then redirect from a file). The skill uses the
-stdin form to avoid shell quoting issues on long XML prompts:
+Both accept PROMPT either as a trailing argument or as stdin. Two stdin
+shapes are accepted by codex itself:
 
 ```bash
+# A. stdin redirect from file
 codex exec ... - < /tmp/codex-prompt-*.md
+
+# B. pipe through cat
+cat /tmp/codex-prompt-*.md | codex exec ... -
 ```
+
+**Both shapes work in some environments; only (B) works reliably in all
+observed Claude Code sandboxes.** In at least one sandbox configuration,
+form (A) exits 1 with empty stderr (no codex error message) while form
+(B) produces an identical `-o` review file. We do not have a root-cause
+diagnosis for (A)'s failure — it is consistent across codex 0.120.0 and
+0.121.0 in the affected environment, so it is not a codex version issue.
+See `§6.6` for the observation log.
+
+The skill therefore uses form (B) as canonical (`§4.1` captures the
+decision). Long XML prompts still need file delivery to avoid shell
+quoting issues, so the file is written via the Write tool and fed
+through `cat | ... -` rather than embedded as a command-line argument.
 
 ### §2.2. Output streams
 
@@ -190,6 +206,16 @@ head -1 /tmp/a.out  # expect {"type":"thread.started",...}
 wc -c /tmp/a.err    # expect 0
 ```
 
+**Environment-specific suppression.** In at least one observed Claude
+Code sandbox, `--json` stdout is empty (0 bytes) when redirected to a
+file, even though the `-o` path is populated correctly and the process
+exits 0. The `-o` file has the review, stderr is empty, only stdout
+JSONL is missing. This is reproducible across codex 0.120.0 and 0.121.0
+in that environment and not reproducible in the reference environment.
+Root cause is not diagnosed; see `§6.6` for the observation log. The
+skill handles it with a secondary filesystem-based session-id capture
+path (`§4.1b`) so resume still works.
+
 **`-o FILE` flag:**
 
 Writes the final agent message to FILE as plain text, *regardless* of
@@ -210,6 +236,24 @@ The UUID is the session / thread id and is accepted verbatim by
 
 `--ephemeral` disables persistence. Not used by the skill — resume
 requires persistence.
+
+**Session-id recovery from the filesystem.** Because the UUID is a
+deterministic suffix of the filename, session id can be recovered from
+disk after the fact, independent of whether `--json` emitted the
+`thread.started` event to stdout. The skill uses this as a secondary
+capture path (`§4.1b`) when stdout is empty.
+
+Verify:
+
+```bash
+BEFORE=$(date +%s)
+echo "respond PONG" | codex exec -m gpt-5.4 -s read-only \
+  --skip-git-repo-check -o /tmp/x.md - >/dev/null 2>&1
+find ~/.codex/sessions -name 'rollout-*.jsonl' -newermt "@${BEFORE}" \
+  | sort | tail -1 | xargs -n1 basename \
+  | grep -oE '[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}'
+# expect: a UUID, and that UUID accepted by `codex exec resume`
+```
 
 ### §2.4. Resume semantics
 
@@ -372,35 +416,67 @@ Each decision below follows the same template:
 - **Chosen because** — the load-bearing argument.
 - **Trade-offs accepted** — what we gave up.
 
-### §4.1. Use `--json` for session ID capture
+### §4.1. Two-tier session ID capture (`--json` primary, rollout filename secondary)
 
 - **Decision.** Every `codex exec` and `codex exec resume` invocation
-  uses `--json` and redirects stdout to `/tmp/codex-stdout-${REVIEW_ID}.jsonl`.
-  Session ID is parsed from the first JSONL event's `thread_id` field.
-- **Where in SKILL.md.** Step 4 (launch), Step 7 (resume).
-- **Context.** Earlier skill versions parsed `session id:` from
-  stderr. That line was reliable on the Codex side but unreliable on
-  the Claude side because the Bash tool truncates output at ~30 KB,
-  retaining the tail. Long reasoning pushed the early metadata block
-  (including the session id) out of the retained window on high-effort
-  reviews.
+  uses `--json` with stdout redirected to
+  `/tmp/codex-stdout-${REVIEW_ID}.jsonl`. Session ID capture tries
+  **primary first, then secondary**:
+  - **Primary** (`§4.1a`): parse `thread_id` from the first line of
+    JSONL stdout.
+  - **Secondary** (`§4.1b`): if stdout is empty, extract the UUID from
+    the filename of the newest `~/.codex/sessions/**/rollout-*.jsonl`
+    with `mtime > CODEX_SESSIONS_BEFORE` (a timestamp captured
+    immediately before the exec).
+- **Where in SKILL.md.** Step 4 (launch), Step 7 (resume). Both tiers
+  live inline in each Step.
+- **Context.** The primary path covers the reference environment
+  cleanly (JSONL events reliably land in the redirected file). In at
+  least one Claude Code sandbox, the JSONL stdout is suppressed (0
+  bytes) even on exit 0 and a populated `-o` review file (`§2.2`,
+  `§6.6`). Without a secondary path, the skill cannot resume in that
+  environment — every round would need a fresh `codex exec`, wasting
+  tokens on project re-reads. The filesystem path was previously
+  rejected (see "Alternatives considered" below) but the rejection
+  only applies when it is the *primary* capture; as a *secondary*
+  fallback its failure modes are acceptable.
 - **Alternatives considered.**
-  - *Keep parsing stderr.* Rejected: same truncation problem.
+  - *Keep parsing `session id:` from stderr.* Rejected: Bash tool
+    truncates output at ~30 KB from the head (§3.1); long reasoning
+    traces pushed the session-id line out of the retained window.
+    (Historical reason for moving to `--json` in the first place.)
   - *Redirect stderr to a file, Read via Read tool.* Rejected: an
     earlier skill version did exactly this and a diagnostic dump still
-    reported empty stderr files, suggesting a fragility we did not
-    want to investigate further. Worse, stderr's session-id line is
-    not in a stable absolute position.
-  - *Extract UUID from the latest `~/.codex/sessions/**/rollout-*.jsonl`
-    filename.* Rejected: fragile against parallel codex invocations;
-    filesystem race.
-- **Chosen because.** In JSON mode the `thread_id` is in the *first
-  line* of stdout, at an offset of <100 bytes from the file start. Read
-  tool retrieves it independent of Bash truncation. The format is
-  documented and enforced by Codex.
-- **Trade-offs accepted.** Human-readable review is no longer in stdout
-  (it went to `-o` only). That is fine for the skill — in fact it is
-  *load-bearing* for the show-review gate (§4.9).
+    reported empty stderr files. §3.2 says Read bypasses Bash
+    truncation, so this might have been viable — but since `§4.1a`
+    covers the reference environment and `§4.1b` covers the sandboxed
+    one, adding a third path is not worth the complexity.
+  - *Use only the filesystem path as the single source.* Rejected:
+    relies on a filesystem race window against any parallel codex
+    invocation in the same second. As a secondary (only consulted
+    when stdout is empty) the race is rare, and when it does hit,
+    one of the Step 7 post-resume checks (`§4.8`) catches the wrong
+    session and routes to the standard fallback (`§4.11`).
+  - *Drop `--json` entirely and use plain-text stdout.* Rejected:
+    `--json` makes stdout machine-readable only, which is *load-
+    bearing* for the show-review gate (`§4.9`). Plain-text stdout
+    would re-expose the "Opus sees the review in Bash result, skips
+    the user-visible show step" failure mode.
+- **Chosen because.** Two-tier keeps primary cheap and documented on
+  the Codex side (the `thread.started` event is in the CLI contract),
+  while the secondary isolates the skill from env-specific stdout
+  quirks we cannot control (`§6.6`). Neither tier alone covers both
+  observed environments; together they do.
+- **Trade-offs accepted.**
+  - Human-readable review is no longer in stdout (it went to `-o`
+    only) — load-bearing for `§4.9`.
+  - Secondary path introduces a filesystem race against parallel
+    codex invocations (§9.1 scope). Mitigated by the pre-exec
+    timestamp (`CODEX_SESSIONS_BEFORE`) narrowing the window to
+    "files created between the two timestamps" rather than "newest
+    anywhere".
+  - Extra permission surface: `Bash(find ...)` is now in the
+    recommended permissions list.
 
 ### §4.2. Capture `REPO_ROOT` at Step 2, substitute literally
 
@@ -654,6 +730,36 @@ Each decision below follows the same template:
   rounds, retry budget is inconsistently available. Rules section of
   `SKILL.md` states this explicitly.
 
+### §4.13. Canonical prompt delivery via `cat file | codex exec -`
+
+- **Decision.** The skill feeds prompts to `codex exec` via
+  `cat /tmp/codex-prompt-*.md | timeout 600 codex exec ... -` instead
+  of `codex exec ... - < /tmp/codex-prompt-*.md`.
+- **Where in SKILL.md.** Step 4 (launch), Step 7 (resume), Step 7
+  fresh-exec fallback.
+- **Context.** Both shapes are accepted by codex itself (`§2.1`). In
+  the reference environment they are interchangeable. In at least one
+  Claude Code sandbox, the `- < file` form exits 1 with empty stderr
+  — codex never actually runs, and without a stderr error line the
+  skill has nothing to diagnose. The `cat | pipe` form is unaffected
+  in the same sandbox and produces identical `-o` output.
+- **Alternatives considered.**
+  - *Keep `- < file` as canonical.* Rejected: verified-broken in one
+    target environment.
+  - *Branch by environment (detect sandbox, switch form).* Rejected:
+    over-complicated for a Pareto case. `cat | pipe` is universal.
+  - *Use the trailing-argument form (`codex exec ... "$(cat file)"`).*
+    Rejected: shell quoting on long XML prompts is the exact problem
+    file delivery solves.
+- **Chosen because.** `cat | pipe` works in every observed environment
+  at no extra cost. The only visible artifact is in the permission
+  rule (`Bash(cat /tmp/codex-prompt-* | timeout 600 codex exec *)`)
+  which is still prefix-matchable.
+- **Trade-offs accepted.** One extra process (`cat`) per codex launch
+  — negligible. The pipeline exit code semantics are `$?` = last
+  command (codex), which matches what the skill already checks; no
+  `pipefail` needed.
+
 ---
 
 ## §5. Rejected ideas
@@ -781,6 +887,56 @@ decision is built on top of it. This document's `§2` and `§7` are
 structured so future contributors can replicate the verification in
 minutes, not hours.
 
+### §6.6. 2026-04-17: Environment-specific stdout suppression, not a version bug
+
+**Claim trajectory.** An agent running in a different Claude Code
+sandbox reported three issues with the skill:
+
+1. `codex exec ... - < /tmp/prompt.md` exits 1 with empty stderr.
+2. `cat file | codex exec --json ... -` exits 0 with review file OK
+   but `/tmp/codex-stdout-*.jsonl` empty (0 bytes).
+3. Same symptoms under `timeout 120 bash -c '...'` wrapper.
+
+Initial hypothesis: codex version bug. The agent was on 0.120.0,
+reference environment on 0.121.0. Upgrading the agent to 0.121.0 left
+all three symptoms unchanged. Therefore: not a codex version issue.
+
+**Reality.** In the reference environment (WSL2, 0.121.0) all three
+shapes produce non-empty JSONL stdout and EXIT=0. In the agent's
+environment (containerized, 0.121.0) they do not. Same codex binary
+version, different outputs. The `codex --version` command itself
+prints to stdout in the reference env but not in the agent's env —
+further evidence of environment-level stdout interception or
+suppression rather than codex misbehavior.
+
+**Root cause.** Not diagnosed. Plausible hypotheses: Node.js stdout
+buffering interaction with the sandbox's process-wrapping (short
+writes lost on exit), or a sandbox-level stdout tee that discards
+output, or a libuv/file-descriptor interaction specific to the
+container environment. None confirmed.
+
+**Mitigation.** The skill cannot control the environment, so the
+skill adapted: the filesystem-based session-id recovery path (`§4.1b`)
+was promoted from "rejected alternative" to "secondary capture".
+Both tiers coexist — primary for reference-env performance, secondary
+for affected-env correctness. The `cat | pipe` form (`§4.13`) was
+chosen as canonical prompt delivery because it works in both envs
+while `- < file` fails in the affected one.
+
+**Impact on the design.** The §4.1 rejection of filesystem-UUID
+parsing was reread: it was correct as a reason to reject *primary*
+reliance on it (race hazards against parallel codex), but not as a
+reason to reject it as *secondary*. Re-reading old rejections with a
+specific role in mind is sometimes more useful than re-verifying
+claims.
+
+**Lesson (augmenting §6.5).** When a single-source report reproduces
+after verification, the follow-up question is still "what exactly did
+I verify?" The first verification (running §7.1 in the reference
+environment) proved the skill contract worked — in that environment.
+It did not prove the contract worked universally. Contract verification
+is env-specific until demonstrated otherwise.
+
 ---
 
 ## §7. Smoke test protocol
@@ -797,6 +953,7 @@ the repo root. Expected outputs are in comments.
 ```bash
 REVIEW_ID=$(date +%s)-$(printf '%08d' $RANDOM)
 REPO_ROOT=$(git rev-parse --show-toplevel)
+CODEX_SESSIONS_BEFORE=$(date +%s)
 cat > /tmp/codex-prompt-${REVIEW_ID}.md <<'EOF'
 <role>
 You are a senior adversarial reviewer of implementation plans.
@@ -809,18 +966,24 @@ End the LAST line with exactly: VERDICT: APPROVED
 </output_format>
 EOF
 
-timeout 300 codex exec --json \
+cat /tmp/codex-prompt-${REVIEW_ID}.md | timeout 300 codex exec --json \
   -m gpt-5.4 -c model_reasoning_effort=low \
   -s read-only -C "${REPO_ROOT}" \
   -o /tmp/codex-review-${REVIEW_ID}.md \
-  - < /tmp/codex-prompt-${REVIEW_ID}.md \
+  - \
   > /tmp/codex-stdout-${REVIEW_ID}.jsonl \
   2>/tmp/codex-stderr-${REVIEW_ID}.txt
 
 echo "EXIT=$?"                                          # expect 0
-head -1 /tmp/codex-stdout-${REVIEW_ID}.jsonl            # expect {"type":"thread.started","thread_id":"..."}
+head -1 /tmp/codex-stdout-${REVIEW_ID}.jsonl            # reference env: thread.started; affected env: empty
 wc -c /tmp/codex-stderr-${REVIEW_ID}.txt                # expect 0
 grep -E '^VERDICT:' /tmp/codex-review-${REVIEW_ID}.md   # expect VERDICT: APPROVED
+
+# Verify the filesystem secondary path also works (§4.1b)
+find ~/.codex/sessions -name 'rollout-*.jsonl' -newermt "@${CODEX_SESSIONS_BEFORE}" \
+  | sort | tail -1 | xargs -r -n1 basename \
+  | grep -oE '[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}'
+# expect: one UUID. If head -1 stdout had thread_id, this UUID should match.
 ```
 
 ### §7.2. Resume with cd prefix
@@ -932,6 +1095,7 @@ If §7.1–§7.5 do not produce the expected outputs:
 | Date | Codex CLI | Claude Code | Verifier | Notes |
 |------|-----------|-------------|----------|-------|
 | 2026-04-17 | 0.121.0 | current at time of refactor | initial author | All §2 facts verified; §7 smoke test passes end to end. Initial commit of this document. |
+| 2026-04-17 | 0.121.0 | containerized sandbox (yantar-k8s) | external agent + lead | §7.1 `- < file` form fails EXIT=1 with empty stderr. `cat \| pipe` form works for `-o` review, but `--json` stdout is empty. Filesystem secondary session-id capture (§4.1b) verified functional: UUID extracted from rollout filename successfully resumes. Not a version issue (reproduced on 0.120.0 and 0.121.0). Root cause undiagnosed — see §6.6. Skill adapted: `§4.1` now two-tier, `§4.13` switches canonical form to `cat \| pipe`. |
 
 When you re-verify (either during routine maintenance or when
 triggered by §7.7), add a row. Keep the log chronological.

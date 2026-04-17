@@ -110,10 +110,14 @@ chosen config file:
 "Bash(git status*)",
 "Bash(git symbolic-ref*)",
 "Bash(git rev-parse*)",
-// Codex: initial launch (uses -C; no cd prefix needed)
-"Bash(timeout 600 codex exec *)",
-// Codex: resume (needs cd prefix to REPO_ROOT because resume has no -C flag)
-"Bash(cd * && timeout 600 codex exec resume *)",
+// Pre-exec timestamp capture (for session-id filesystem fallback)
+"Bash(date +%s)",
+// Codex: initial launch (uses -C; prompt fed via cat | pipe for env portability)
+"Bash(cat /tmp/codex-prompt-* | timeout 600 codex exec *)",
+// Codex: resume (cd prefix because resume has no -C flag; prompt via cat | pipe)
+"Bash(cd * && cat /tmp/codex-resume-prompt-* | timeout 600 codex exec resume *)",
+// Session-id filesystem fallback (newest rollout file in ~/.codex/sessions/)
+"Bash(find * -name rollout-*)",
 // Temp files: prompts (initial + resume), plans, review output, JSONL stdout, stderr
 "Write(/tmp/codex-plan-*)",
 "Write(/tmp/codex-prompt-*)",
@@ -121,9 +125,8 @@ chosen config file:
 "Read(/tmp/codex-review-*)",
 "Read(/tmp/codex-stdout-*)",
 "Read(/tmp/codex-stderr-*)",
-// Cleanup and output piping
-"Bash(rm -f /tmp/codex-*)",
-"Bash(tee *)"
+// Cleanup
+"Bash(rm -f /tmp/codex-*)"
 ```
 
 <details>
@@ -138,16 +141,17 @@ chosen config file:
       "Bash(git status*)",
       "Bash(git symbolic-ref*)",
       "Bash(git rev-parse*)",
-      "Bash(timeout 600 codex exec *)",
-      "Bash(cd * && timeout 600 codex exec resume *)",
+      "Bash(date +%s)",
+      "Bash(cat /tmp/codex-prompt-* | timeout 600 codex exec *)",
+      "Bash(cd * && cat /tmp/codex-resume-prompt-* | timeout 600 codex exec resume *)",
+      "Bash(find * -name rollout-*)",
       "Write(/tmp/codex-plan-*)",
       "Write(/tmp/codex-prompt-*)",
       "Write(/tmp/codex-resume-prompt-*)",
       "Read(/tmp/codex-review-*)",
       "Read(/tmp/codex-stdout-*)",
       "Read(/tmp/codex-stderr-*)",
-      "Bash(rm -f /tmp/codex-*)",
-      "Bash(tee *)"
+      "Bash(rm -f /tmp/codex-*)"
     ]
   }
 }
@@ -214,6 +218,15 @@ whether to run a fresh `codex exec` (higher token cost) or conclude the
 review as NOT VERIFIED. In headless runs it decides based on the maximum
 severity of the last successful round's findings: critical/high → fresh
 exec; medium-only → conclude as NOT VERIFIED.
+
+**`--json` stdout is empty in my Claude Code session (session ID capture noise).**
+In some Claude Code sandbox configurations codex's `--json` event stream is
+suppressed when stdout is redirected to a file — the `/tmp/codex-stdout-*.jsonl`
+ends up 0 bytes even though the review itself (`-o /tmp/codex-review-*.md`)
+completes correctly. The skill handles this automatically via a filesystem
+fallback: when the JSONL stream is empty it extracts the session UUID from
+the newest `~/.codex/sessions/YYYY/MM/DD/rollout-*-<UUID>.jsonl` filename
+created since the pre-exec timestamp. Resume continues to work normally.
 
 **"NOT VERIFIED" result.**
 The skill applied fixes but the reviewer did not re-verify them (resume

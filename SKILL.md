@@ -308,30 +308,38 @@ And the following items are added to `<attack_surface>`:
 **Launching Codex — command template:**
 
 Flags:
-- `--json` — stdout becomes JSONL events; **required** for deterministic session-ID capture
+- `--json` — stdout becomes JSONL events (primary path for session-ID capture). In some sandbox configurations this stream ends up empty; the filesystem fallback in check 3 below handles that case.
 - `-m gpt-5.4` — model (overridden by `model:...` argument)
 - `-c model_reasoning_effort=high` — reasoning depth (overridden by `xhigh`, `low`, etc.)
 - `-s read-only` — reviewer only reads, does not write
 - `-C "${REPO_ROOT}"` — pin codex workdir to absolute repo root
 - `-o /tmp/codex-review-${REVIEW_ID}.md` — file for capturing final agent text
 
-**Prompt delivery:** write the prompt to `/tmp/codex-prompt-${REVIEW_ID}.md` via **Write tool**, then pass via stdin redirection (`- < file`). This avoids shell quoting issues with long XML prompts.
+**Prompt delivery:** write the prompt to `/tmp/codex-prompt-${REVIEW_ID}.md` via **Write tool**, then feed it to codex via `cat file | codex exec ... -`. This avoids shell quoting issues with long XML prompts and is environment-portable (the alternative `- < file` stdin-redirect form is accepted by codex but fails with `EXIT=1` in some Claude Code sandbox configurations).
 
 **Plan Mode note:** Writing to `/tmp` via Write tool may trigger a permission prompt or exit Plan Mode. This is a known Claude Code limitation — Plan Mode restricts edits to the plan file only. If this happens, it does not affect review correctness: the review mode is already determined, and the skill only edits the plan file and `/tmp` temp files.
 
+**Capture pre-exec timestamp** (for filesystem fallback of session-id; see check 3 below). Substitute the value literally:
+
 ```bash
-timeout 600 codex exec --json \
+date +%s
+```
+
+Save as `CODEX_SESSIONS_BEFORE` (a template placeholder — a Unix timestamp as an integer).
+
+```bash
+cat /tmp/codex-prompt-${REVIEW_ID}.md | timeout 600 codex exec --json \
   -m gpt-5.4 \
   -c model_reasoning_effort=high \
   -s read-only \
   -C "${REPO_ROOT}" \
   -o /tmp/codex-review-${REVIEW_ID}.md \
-  - < /tmp/codex-prompt-${REVIEW_ID}.md \
+  - \
   > /tmp/codex-stdout-${REVIEW_ID}.jsonl \
   2>/tmp/codex-stderr-${REVIEW_ID}.txt
 ```
 
-> **CRITICAL — the Bash tool result is NOT the review.** With `--json`, stdout is a machine-readable JSONL event stream (thread.started, turn.started, item.completed, turn.completed). It is not human-readable. The human-readable review exists ONLY in `/tmp/codex-review-${REVIEW_ID}.md`. Do not attempt to extract review text from the Bash result — there is none.
+> **CRITICAL — the Bash tool result is NOT the review.** stdout is redirected to `/tmp/codex-stdout-${REVIEW_ID}.jsonl` (machine-readable JSONL events when populated, empty when the sandbox suppresses it — either way, never human-readable review text). The human-readable review exists ONLY in `/tmp/codex-review-${REVIEW_ID}.md`. Do not attempt to extract review text from the Bash result — there is none.
 
 **Important:**
 - Always wrap `codex exec` in `timeout 600` (10 minutes). If Codex hangs — the command exits with code 124.
@@ -351,12 +359,30 @@ timeout 600 codex exec --json \
    - If file contains a line matching `^Error:` or `Failed to write` → codex reported an infrastructure failure despite exit 0. Show stderr to user, route to launch-failure retry (max 1 per round; after retry failure → hard abort).
    - Otherwise → proceed.
 
-3. **Capture `CODEX_SESSION_ID` from JSONL stdout.** Read `/tmp/codex-stdout-${REVIEW_ID}.jsonl`. First line format:
+3. **Capture `CODEX_SESSION_ID` — two-tier.**
+
+   **Primary: first line of JSONL stdout.** Read `/tmp/codex-stdout-${REVIEW_ID}.jsonl`. First line format:
    ```json
    {"type":"thread.started","thread_id":"<uuid>","...":...}
    ```
-   Parse the first line as JSON and extract `thread_id`. Save as `CODEX_SESSION_ID`.
-   - If the first line is not valid JSON or has no `thread_id` → treat as launch failure; show stderr, retry once, then abort.
+   Parse as JSON and extract `thread_id`. If valid → save as `CODEX_SESSION_ID` and skip to check 4.
+
+   **Secondary: rollout filename.** In some Claude Code sandbox configurations the `--json` stdout file is empty (0 bytes) even when the review completes successfully and `-o` is populated correctly. If the primary path yielded no `thread_id`, fall back to the filesystem:
+
+   ```bash
+   find ~/.codex/sessions -name 'rollout-*.jsonl' -newermt "@${CODEX_SESSIONS_BEFORE}" 2>/dev/null \
+     | sort | tail -1 \
+     | xargs -r -n1 basename \
+     | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+     | head -1
+   ```
+
+   Codex writes a rollout file named `rollout-<ISO-timestamp>-<UUID>.jsonl` (see `DESIGN.md §2.3`). The UUID in the filename is the session id that `codex exec resume` accepts.
+
+   - Non-empty UUID output → save as `CODEX_SESSION_ID`.
+   - Empty output (no new rollout file found within the pre-exec timestamp window) → treat as launch failure; show stderr, retry once, then abort.
+
+   **Parallel-codex caveat:** if the user runs `codex` in parallel in the same time window, the newest rollout file may be from that other invocation. This is rare, and if it happens the round's resume will fail one of the Step 7 post-resume checks and route to the standard fallback (§4.11).
 
 4. **Review file sanity.** (Performed again in Step 5, but note upfront.) `/tmp/codex-review-${REVIEW_ID}.md` must exist and contain a line matching `^VERDICT: (APPROVED|REVISE)$`. If not → Step 5 will handle it via retry/abort.
 
@@ -364,7 +390,7 @@ timeout 600 codex exec --json \
 
 - NOT in `/tmp/codex-review-${REVIEW_ID}.md` (only contains the final agent text)
 - NOT in stderr file under `--json` (empty on success; error text only on failure)
-- NOT in the middle or tail of stdout — only the **first line** of the JSONL file
+- NOT in the middle or tail of stdout — only the **first line** of the JSONL file (when it is populated at all)
 
 **Notes:**
 - Default model: `gpt-5.4` with `model_reasoning_effort=high`. User can override via arguments.
@@ -453,11 +479,19 @@ End with VERDICT: APPROVED or VERDICT: REVISE
 
 **2. Run resume.** Resume does NOT accept `-C`, so prefix the command with an explicit `cd` to `${REPO_ROOT}` (captured at Step 2). Use single quotes around `${REPO_ROOT}` — the path was validated at Step 2 to contain no single quotes.
 
+Capture a pre-resume timestamp for the secondary session-id fallback (same pattern as Step 4):
+
 ```bash
-cd '${REPO_ROOT}' && timeout 600 codex exec resume --json \
+date +%s
+```
+
+Save as `CODEX_SESSIONS_BEFORE`. Then launch resume via the same `cat | ... -` pattern:
+
+```bash
+cd '${REPO_ROOT}' && cat /tmp/codex-resume-prompt-${REVIEW_ID}.md | timeout 600 codex exec resume --json \
   ${CODEX_SESSION_ID} \
   -o /tmp/codex-review-${REVIEW_ID}.md \
-  - < /tmp/codex-resume-prompt-${REVIEW_ID}.md \
+  - \
   > /tmp/codex-stdout-${REVIEW_ID}.jsonl \
   2>/tmp/codex-stderr-${REVIEW_ID}.txt
 ```
@@ -480,7 +514,12 @@ Use `timeout: 620000` in Bash tool parameters.
 3. **Review file sanity.** Read `/tmp/codex-review-${REVIEW_ID}.md` and apply the same checks as Step 5.2:
    - Missing / empty / no `^VERDICT: (APPROVED|REVISE)$` line / REVISE without `[severity:` lines → route to fallback. Do NOT update `CODEX_SESSION_ID`.
 
-**4. Only if all three checks pass** → update `CODEX_SESSION_ID` from the first JSONL line of `/tmp/codex-stdout-${REVIEW_ID}.jsonl`. Each successful resume rotates the thread id; subsequent resumes MUST use the new id.
+**4. Only if all three checks pass** → update `CODEX_SESSION_ID` using the same two-tier capture as Step 4 check 3:
+
+   - **Primary**: parse `thread_id` from the first JSONL line of `/tmp/codex-stdout-${REVIEW_ID}.jsonl`.
+   - **Secondary (if primary empty)**: the newest `~/.codex/sessions/**/rollout-*.jsonl` with mtime > `CODEX_SESSIONS_BEFORE`; extract the trailing UUID from the filename.
+
+Per `DESIGN.md §2.4.4`, successful resume does NOT rotate the thread id — the new value equals the previous one. The update is defensive (in case a future Codex version changes this). If both tiers yielded nothing but all three checks passed → keep the previous `CODEX_SESSION_ID` unchanged.
 
 After updating `CODEX_SESSION_ID`, return to **Step 5** with the new review.
 
@@ -545,7 +584,7 @@ End with VERDICT: APPROVED or VERDICT: REVISE.
 
 Write this prompt to `/tmp/codex-prompt-${REVIEW_ID}.md` (overwriting the original is acceptable here; diagnostic files for the failed resume remain in `/tmp/codex-stderr-*` and `/tmp/codex-stdout-*`).
 
-Launch using the **same command template as Step 4** (with `--json`, `-C`, `-o`, stdin, stdout jsonl, stderr), apply the same post-launch strict check order, capture a fresh `CODEX_SESSION_ID`, then return to **Step 5**.
+Launch using the **same command template as Step 4** (`cat file | timeout 600 codex exec --json ... -` with `-C`, `-o`, stdout jsonl, stderr; also re-capture `CODEX_SESSIONS_BEFORE` immediately before the call), apply the same post-launch strict check order including the two-tier session-id capture, then return to **Step 5**.
 
 > This fresh exec consumes one round from the 5-round counter — same as a successful resume would have.
 
@@ -629,7 +668,9 @@ Do NOT delete plan files that existed before the review (only temp files created
 - **`REPO_ROOT` is captured at Step 2** via `git rev-parse --show-toplevel` and substituted as an absolute literal path into every codex command. Never use `$(pwd)` inside codex commands — cwd drift between Bash calls makes it unreliable.
 - **Resume requires `cd '${REPO_ROOT}' && ...`** because `codex exec resume` has no `-C` flag; cwd is inherited from the shell. The initial exec uses `-C "${REPO_ROOT}"` instead.
 - **`CODEX_SESSION_ID` is updated only on full success** — ALL of (exit=0 AND stderr has no `Error:`/`thread/resume failed` line AND review file contains a valid `VERDICT:` line with findings on REVISE). On any failure, leave it unchanged and route to the fallback.
-- **The `--json` stdout stream is machine-readable JSONL only.** The human review exists exclusively in `/tmp/codex-review-*.md`. Never treat Bash result as review content.
+- **Session ID capture is two-tier.** Primary: `thread_id` from the first JSONL line of stdout. Secondary (when stdout is empty — env-specific): UUID from the trailing component of the newest `~/.codex/sessions/**/rollout-*.jsonl` filename with mtime > `CODEX_SESSIONS_BEFORE`. Capture `CODEX_SESSIONS_BEFORE=$(date +%s)` **before** every `codex exec` / `codex exec resume` call.
+- **Prompt delivery is `cat file | codex exec ... -`.** The `- < file` stdin-redirect form is accepted by codex but exits 1 with empty stderr in some Claude Code sandbox configurations. Pipe is portable across both envs observed.
+- **The `--json` stdout stream is never human-readable review text** — JSONL events when populated, empty when suppressed by sandbox. Never treat Bash result as review content; the review lives exclusively in `/tmp/codex-review-*.md`.
 - **Launch-failure retry** is capped at 1 per round and does NOT consume the 5-round counter. The retry counter is per-round; it resets at the start of every new round and is tracked only in that round's reasoning.
 - **Resume is the primary path for rounds 2-5.** Fresh exec is a fallback that runs only when resume fails; it consumes one round from the counter just as a successful resume would.
 - **`--last` is never used** — cwd filtering is insufficient to distinguish the current skill session from unrelated parallel codex invocations in the same repo.
