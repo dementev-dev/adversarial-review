@@ -622,7 +622,9 @@ rm -f /tmp/codex-plan-${REVIEW_ID}.md \
       /tmp/codex-stdout-${REVIEW_ID}.jsonl \
       /tmp/codex-stderr-${REVIEW_ID}.txt \
       /tmp/codex-stdout-${REVIEW_ID}-failed-resume.jsonl \
-      /tmp/codex-stderr-${REVIEW_ID}-failed-resume.txt
+      /tmp/codex-stderr-${REVIEW_ID}-failed-resume.txt \
+      /tmp/codex-body-${REVIEW_ID}.md \
+      /tmp/codex-runner-result-${REVIEW_ID}.json
 ```
 
 If the user declined `rm` — continue without error.
@@ -632,21 +634,20 @@ Do NOT delete plan files that existed before the review (only temp files created
 ## Rules
 
 - Claude **actively fixes** issues based on reviewer feedback — this is NOT just message forwarding.
-- Reviewer findings are shown **verbatim** — do not rephrase or shorten. The Step 5 "YOUR NEXT MESSAGE" instruction is blocking: no edit/fix tool may be called until that message has been sent.
+- Reviewer findings are shown **verbatim** — do not rephrase or shorten. The Step 5 "YOUR NEXT MESSAGE" instruction is blocking.
 - Auto-detect review mode from context; user arguments take priority.
 - With explicit `plan` argument or in Claude Code Plan Mode: skip git checks and base branch detection.
-- **`REPO_ROOT` is captured at Step 2** via `git rev-parse --show-toplevel` and substituted as an absolute literal path into every codex command. Never use `$(pwd)` inside codex commands — cwd drift between Bash calls makes it unreliable.
-- **Resume requires `cd '${REPO_ROOT}' && ...`** because `codex exec resume` has no `-C` flag; cwd is inherited from the shell. The initial exec uses `-C "${REPO_ROOT}"` instead.
-- **`CODEX_SESSION_ID` is updated only on full success** — ALL of (exit=0 AND stderr has no `Error:`/`thread/resume failed` line AND review file contains a valid `VERDICT:` line with findings on REVISE). On any failure, leave it unchanged and route to the fallback.
-- **Session ID capture is two-tier.** Primary: `thread_id` from the first JSONL line of stdout. Secondary (primary empty / malformed / missing `thread_id`): the rollout file that is both `-newer` than the prompt file AND contains the `ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID}` marker for THIS launch, with UUID from the filename. Positive content-binding eliminates wrong-session hazard from both parallel codex invocations AND same-review retries.
-- **Every prompt starts with `<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID} -->` as its first line.** Generate a **fresh 6-digit ATTEMPT_ID per launch** (initial exec, any retry of that exec, each resume in Step 7, any fresh-exec fallback). Never reuse an ATTEMPT_ID within the same review — doing so would let a prior attempt's rollout match the current launch's grep, reintroducing session drift.
-- **Secondary-path multi-match is fail-closed, not pick-any.** If the `find ... -exec grep -l ... {} +` returns two or more rollout paths for a single `${REVIEW_ID}-${ATTEMPT_ID}`, abort the round with a diagnostic. This should not happen under correct attempt-scoping; if it does, something is structurally wrong and silent picking would mask it.
-- **Prompt delivery is `cat file | codex exec ... -`.** The `- < file` stdin-redirect form is accepted by codex but exits 1 with empty stderr in some Claude Code sandbox configurations. Pipe is portable across both envs observed.
-- **The `--json` stdout stream is never human-readable review text** — JSONL events when populated, empty when suppressed by sandbox. Never treat Bash result as review content; the review lives exclusively in `/tmp/codex-review-*.md`.
-- **Launch-failure retry** is capped at 1 per round and does NOT consume the 5-round counter. The retry counter is per-round; it resets at the start of every new round and is tracked only in that round's reasoning.
-- **Resume is the primary path for rounds 2-5.** Fresh exec is a fallback that runs only when resume fails; it consumes one round from the counter just as a successful resume would.
-- **`--last` is never used** — cwd filtering is insufficient to distinguish the current skill session from unrelated parallel codex invocations in the same repo.
-- **Fallback after resume failure:** interactive → ask the user (fresh exec vs conclude as not-verified); non-interactive → auto fresh exec if max severity is critical/high, auto conclude-as-not-verified if only medium.
+- **`REPO_ROOT` is captured at Step 2** and passed as an absolute literal to every runner dispatch.
+- **`RUNNER_SPEC_PATH` is resolved at Step 4** (once per review) with priority: (1) `~/.claude/skills/adversarial-review/references/runner.md` (user-scoped install), (2) Glob `~/.claude/plugins/cache/**/skills/adversarial-review/references/runner.md` and take first hit (plugin-marketplace install), (3) `$(git rev-parse --show-toplevel)/references/runner.md` (dev checkout), (4) abort with installation error. Main never attempts to read Claude's own system prompt / skill-invocation header — that path is hallucination-prone and is explicitly disallowed.
+- **Codex-exec mechanics live in the runner subagent** (`references/runner.md`): ATTEMPT_ID generation, prompt-with-marker writing (with a repeated Write call for mtime freshness — NOT Bash `touch`, which may be gated by inherited Plan Mode), synchronous launch, strict checks, two-tier session-id capture with positive content-bind, ONE internal retry on ANY failure type (launch_failure, timeout, stderr-infra), archival mv on resume failure. Main thread never reads codex stdout/stderr/rollout file CONTENT, and never references those paths in its own Bash argv.
+- **Two-channel result protocol.** Runner writes structured JSON to `/tmp/codex-runner-result-${REVIEW_ID}.json` (authoritative) AND returns a single `RUNNER_RESULT_AT: <path>` line as its final message. Main extracts the path via regex (tolerant to markdown fences / minor wrapping), reads the JSON, and never relies on raw-JSON-in-message parsing.
+- **Main thread reads only**: the runner result JSON, the review file at `review_file`, and the skill's own `references/runner.md`. No other `/tmp/codex-*` reads.
+- **Runner is dispatched via Agent tool** with `subagent_type: general-purpose, model: haiku`. Agent tool call is synchronous (not `run_in_background`).
+- **ALL runner failure results are TERMINAL at main** (`launch_failure`, `timeout`, `infra_error`, `input_error`). Runner retries once internally on ANY failure. Main does NOT re-dispatch and does NOT offer the user a retry — those lanes would compound retries across layers. Total codex invocations per round ≤ 2 (matches pre-refactor invariant: 1 initial + 1 retry). Fresh-exec fallback is a NEW round with its own independent 2-attempts budget.
+- **`user_warning` from the runner must be surfaced to the user** on a single line BEFORE any other action. This preserves the pre-refactor §2.4.4 "both tiers empty, continuing with previous ID" diagnostic.
+- **`CODEX_MODEL` / `CODEX_REASONING`** in the runner input schema refer to the model codex CLI launches (e.g. `gpt-5.4`). The runner's OWN model is Haiku, set via Agent tool's `model: "haiku"`. Do NOT conflate.
+- **Resume is the primary path for rounds 2-5.** Fresh-exec fallback consumes one round from the 5-round counter.
+- **Step 9 cleanup `rm` glob is UNCHANGED from pre-refactor.** It still covers `/tmp/codex-plan-${REVIEW_ID}.md`, `/tmp/codex-prompt-${REVIEW_ID}.md`, `/tmp/codex-resume-prompt-${REVIEW_ID}.md`, `/tmp/codex-review-${REVIEW_ID}.md`, `/tmp/codex-stdout-${REVIEW_ID}.jsonl`, `/tmp/codex-stderr-${REVIEW_ID}.txt`, `/tmp/codex-stdout-${REVIEW_ID}-failed-resume.jsonl`, `/tmp/codex-stderr-${REVIEW_ID}-failed-resume.txt`. ADD the two new paths introduced by the refactor: `/tmp/codex-body-${REVIEW_ID}.md` and `/tmp/codex-runner-result-${REVIEW_ID}.json`.
 - Cleanup is **conditional on terminal state**: remove temp files on approved/max-reached/not-verified; LEAVE them on abort (diagnostic value). Skip all cleanup in Plan Mode.
 - Always read-only sandbox — reviewer never writes files.
 - Maximum 5 rounds to protect against infinite loops.
