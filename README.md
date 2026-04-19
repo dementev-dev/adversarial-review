@@ -12,8 +12,9 @@ and tries to break confidence in the change. It looks for what will fail
 in production, not what might be nice to improve.
 
 This is a [Claude Code skill](https://docs.anthropic.com/en/docs/claude-code)
-— a single `SKILL.md` file that teaches Claude how to run adversarial reviews
-through an external AI model (currently OpenAI Codex).
+— a `SKILL.md` file plus a small `references/runner.md` that together
+teach Claude how to run adversarial reviews through an external AI model
+(currently OpenAI Codex).
 
 ## Key features
 
@@ -23,8 +24,9 @@ through an external AI model (currently OpenAI Codex).
 - **Code-vs-plan** — verify the implementation matches the plan
 - **Iterative** — Claude fixes issues based on reviewer feedback and resubmits
   for re-review. Up to 5 rounds until approved
-- **Lightweight** — one `SKILL.md` file, no server, no broker. Compare with
-  [codex-plugin-cc](https://github.com/openai/codex-plugin-cc):
+- **Lightweight** — `SKILL.md` + one `references/runner.md` (thin runner
+  subagent spec), no server, no broker, no external runtime deps. Compare
+  with [codex-plugin-cc](https://github.com/openai/codex-plugin-cc):
   ~15 JS modules, App Server, JSON-RPC broker, lifecycle hooks
 
 ## How it works
@@ -77,14 +79,20 @@ If Codex is missing: `npm install -g @openai/codex`
 
 ```bash
 git clone https://github.com/dementev-dev/adversarial-review.git
-ln -s "$(pwd)/adversarial-review" ~/.agents/skills/adversarial-review
+mkdir -p ~/.claude/skills
+ln -sfn "$(pwd)/adversarial-review" ~/.claude/skills/adversarial-review
 ```
 
-Verify the skill is visible to Claude Code:
+Verify both the skill entry-point AND the runner subagent spec are in place:
 
 ```bash
-ls -la ~/.agents/skills/adversarial-review/SKILL.md
+ls -la ~/.claude/skills/adversarial-review/SKILL.md
+ls -la ~/.claude/skills/adversarial-review/references/runner.md
 ```
+
+> **Migrating from a previous install at `~/.agents/skills/`**: delete
+> the old symlink (`rm ~/.agents/skills/adversarial-review`) and
+> install at the new path above. Claude Code ≥ 2.x uses `~/.claude/skills/`.
 
 ### 3. Add permissions
 
@@ -92,7 +100,7 @@ The skill runs `git`, `codex exec`, and writes temp files to `/tmp`.
 Without pre-approved permissions, Claude Code will prompt for each action.
 
 **Where to add.** Since the skill is installed globally
-(`~/.agents/skills/`), permissions should go into the global config
+(`~/.claude/skills/`), permissions should go into the global config
 so they work in any project:
 
 | Install scope | Config file |
@@ -129,7 +137,19 @@ chosen config file:
 "Bash(mv /tmp/codex-stdout-* /tmp/codex-stdout-*-failed-resume.jsonl)",
 "Bash(mv /tmp/codex-stderr-* /tmp/codex-stderr-*-failed-resume.txt)",
 // Cleanup
-"Bash(rm -f /tmp/codex-*)"
+"Bash(rm -f /tmp/codex-*)",
+// Main thread: write prompt body for the runner subagent (NEW in refactor)
+"Write(/tmp/codex-body-*)",
+// Main thread: read the structured JSON result returned by the runner (NEW)
+"Read(/tmp/codex-runner-result-*)",
+// Runner subagent (inherited): read the prompt body main wrote (NEW)
+"Read(/tmp/codex-body-*)",
+// Runner subagent (inherited): write the result JSON main reads (NEW)
+"Write(/tmp/codex-runner-result-*)",
+// Runner-spec discovery: tier 1 (user-scoped install)
+"Bash(ls ~/.claude/skills/adversarial-review/references/runner.md*)",
+// Runner-spec discovery: tier 2 (plugin-marketplace cache)
+"Bash(ls ~/.claude/plugins/cache/*/*/*/skills/adversarial-review/references/runner.md*)"
 ```
 
 <details>
@@ -156,7 +176,13 @@ chosen config file:
       "Read(/tmp/codex-stderr-*)",
       "Bash(mv /tmp/codex-stdout-* /tmp/codex-stdout-*-failed-resume.jsonl)",
       "Bash(mv /tmp/codex-stderr-* /tmp/codex-stderr-*-failed-resume.txt)",
-      "Bash(rm -f /tmp/codex-*)"
+      "Bash(rm -f /tmp/codex-*)",
+      "Write(/tmp/codex-body-*)",
+      "Read(/tmp/codex-runner-result-*)",
+      "Read(/tmp/codex-body-*)",
+      "Write(/tmp/codex-runner-result-*)",
+      "Bash(ls ~/.claude/skills/adversarial-review/references/runner.md*)",
+      "Bash(ls ~/.claude/plugins/cache/*/*/*/skills/adversarial-review/references/runner.md*)"
     ]
   }
 }
@@ -301,7 +327,8 @@ checklist, finding bar, calibration rules.
 What we did differently:
 - **Iterative loop** — Claude fixes issues and resubmits (not "stop and ask user")
 - **Plan review** — reviews plans before code, not just code
-- **Single file** — one SKILL.md vs 15+ JS modules
+- **Minimal install** — `SKILL.md` + one `references/runner.md`, no
+  server, no broker, vs 15+ JS modules
 - **Verbatim output** — reviewer findings shown as-is, not rephrased
 
 ## License
