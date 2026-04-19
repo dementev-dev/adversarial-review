@@ -359,18 +359,17 @@ Save the resolved absolute path as `RUNNER_SPEC_PATH`. Do NOT attempt to extract
 
 **Dispatch the runner subagent via Agent tool:**
 
-Read `${RUNNER_SPEC_PATH}` once (main thread). This is the subagent's full spec.
+**Do NOT Read `${RUNNER_SPEC_PATH}` in main.** Pass the path to the subagent; it reads the spec itself. This keeps runner.md (~12K) out of main's context — both the Read result AND the Agent prompt duplication. Saves ~12K per round × up to 5 rounds per review.
 
 Invoke the Agent tool with:
 - `subagent_type: "general-purpose"`
 - `model: "haiku"`
 - `description: "Adversarial-review runner, round N"` (N is the current round number)
-- `prompt:` the concatenation of:
-  1. The full text of `references/runner.md` you just read (as instructions).
-  2. A blank line.
-  3. A literal YAML input block with the values substituted (use `CODEX_MODEL` and `CODEX_REASONING` — the codex-CLI model/effort; distinct from the subagent's own Haiku model):
+- `prompt:` a short bootstrap instruction + YAML input block (no inlined runner.md):
 
-```yaml
+```
+Read your full instruction spec at ${RUNNER_SPEC_PATH} and follow the steps there using this input:
+
 ---
 REVIEW_ID: 1711872000-48217593
 REPO_ROOT: /home/dementev/sources/myproject
@@ -382,7 +381,7 @@ RESULT_PATH: /tmp/codex-runner-result-1711872000-48217593.json
 ---
 ```
 
-Substitute real values. `RESULT_PATH` always follows the pattern `/tmp/codex-runner-result-${REVIEW_ID}.json`.
+Substitute the actual resolved `${RUNNER_SPEC_PATH}` (absolute path) and real values for every other placeholder. `RESULT_PATH` always follows the pattern `/tmp/codex-runner-result-${REVIEW_ID}.json`.
 
 **Do NOT run the Agent tool call in background.** Wait for the subagent to return. (Runner's own codex exec is also synchronous per runner Step R3.)
 
@@ -502,7 +501,7 @@ Substitute the fixes list from Step 6 (one bullet per finding addressed). Do NOT
 
 **Step 7.2: Dispatch the runner subagent for resume.**
 
-Same Agent tool invocation as Step 4 (runner spec + YAML input block). Reuse the `RUNNER_SPEC_PATH` resolved in Step 4 (do not re-resolve). Input block:
+Same Agent tool invocation as Step 4 (bootstrap instruction with `${RUNNER_SPEC_PATH}` + YAML input block; subagent Reads the spec itself). Reuse the `RUNNER_SPEC_PATH` resolved in Step 4 (do not re-resolve). Input block:
 
 ```yaml
 ---
@@ -641,7 +640,7 @@ Do NOT delete plan files that existed before the review (only temp files created
 - **`RUNNER_SPEC_PATH` is resolved at Step 4** (once per review) with priority: (1) `~/.claude/skills/adversarial-review/references/runner.md` (user-scoped install), (2) Glob `~/.claude/plugins/cache/**/skills/adversarial-review/references/runner.md` and take first hit (plugin-marketplace install), (3) `$(git rev-parse --show-toplevel)/references/runner.md` (dev checkout), (4) abort with installation error. Main never attempts to read Claude's own system prompt / skill-invocation header — that path is hallucination-prone and is explicitly disallowed.
 - **Codex-exec mechanics live in the runner subagent** (`references/runner.md`): ATTEMPT_ID generation, prompt-with-marker writing (with a repeated Write call for mtime freshness — NOT Bash `touch`, which may be gated by inherited Plan Mode), synchronous launch, strict checks, two-tier session-id capture with positive content-bind, ONE internal retry on ANY failure type (launch_failure, timeout, stderr-infra), archival mv on resume failure. Main thread never reads codex stdout/stderr/rollout file CONTENT, and never references those paths in its own Bash argv.
 - **Two-channel result protocol.** Runner writes structured JSON to `/tmp/codex-runner-result-${REVIEW_ID}.json` (authoritative) AND returns a single `RUNNER_RESULT_AT: <path>` line as its final message. Main extracts the path via regex (tolerant to markdown fences / minor wrapping), reads the JSON, and never relies on raw-JSON-in-message parsing.
-- **Main thread reads only**: the runner result JSON, the review file at `review_file`, and the skill's own `references/runner.md`. No other `/tmp/codex-*` reads.
+- **Main thread reads only**: the runner result JSON at `RESULT_PATH` and the review file at `review_file`. Main does NOT Read `references/runner.md` — the runner spec is passed by path to the subagent, which Reads it itself. No other `/tmp/codex-*` reads.
 - **Runner is dispatched via Agent tool** with `subagent_type: general-purpose, model: haiku`. Agent tool call is synchronous (not `run_in_background`).
 - **ALL runner failure results are TERMINAL at main** (`launch_failure`, `timeout`, `infra_error`, `input_error`). Runner retries once internally on ANY failure. Main does NOT re-dispatch and does NOT offer the user a retry — those lanes would compound retries across layers. Total codex invocations per round ≤ 2 (matches pre-refactor invariant: 1 initial + 1 retry). Fresh-exec fallback is a NEW round with its own independent 2-attempts budget.
 - **`user_warning` from the runner must be surfaced to the user** on a single line BEFORE any other action. This preserves the pre-refactor §2.4.4 "both tiers empty, continuing with previous ID" diagnostic.

@@ -1453,6 +1453,8 @@ Claude Code's Agent tool dispatches a fresh subagent with its own isolated conte
 
 The runner uses a two-channel protocol: the authoritative structured result is written to `/tmp/codex-runner-result-${REVIEW_ID}.json`, and the runner's final message is a single `RUNNER_RESULT_AT: <path>` line. Main extracts the path with a tolerant regex (markdown fences and minor wrapping do not break parsing) and reads the JSON file directly. This avoids the brittle "raw JSON in message" contract that Haiku's conversational output style would otherwise stress.
 
+**Runner spec is passed by path, not inlined.** Main resolves `RUNNER_SPEC_PATH` (3-tier filesystem lookup in SKILL.md Step 4) and passes the absolute path to the subagent — the subagent Reads runner.md itself. Main never Reads runner.md. Rationale: inlining the full spec (~12K) into every Agent-tool prompt would re-add ~12K × rounds (up to 5) to main's context per review — 60K of avoidable overhead. Bootstrap instruction in the Agent prompt is ~400 bytes; the spec lives only in the disposable subagent context.
+
 ### §12.3 Retry budget — single owner
 
 Retry lives in the runner alone, across ALL failure types (launch_failure, timeout, stderr-infrastructure-error). Runner retries once internally (same ATTEMPT_ID-rotation as pre-refactor's round-level retry). Main treats EVERY failure result as terminal-for-this-round: on the initial Step-4 dispatch, terminal = abort; on the Step-7 resume dispatch, terminal = route to fallback (fresh-exec, which is a new round with its own budget).
