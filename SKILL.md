@@ -126,27 +126,13 @@ If all sources are empty — no changes to review, inform the user.
 
 **Code-vs-plan review:** prepare the plan path AND collect the list of changed files (as above).
 
-### Step 4: Build the prompt and launch the first round
+### Step 4: Build the prompt body, dispatch the runner subagent
 
-Build the prompt depending on the mode. All prompts use the adversarial stance.
+Main thread composes the prompt BODY (without the session marker — the subagent adds it). Select the right template from below based on review mode.
 
-**All prompts begin with a per-launch session marker.** The FIRST line of every prompt (plan, code, code-vs-plan, resume, fresh-exec fallback) must be a literal HTML-style comment that includes the current `${REVIEW_ID}` AND a fresh `${ATTEMPT_ID}`:
-
-```
-<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID} -->
-```
-
-Example: `<!-- ADVERSARIAL-REVIEW-SESSION: 1711872000-48217593-487201 -->`.
-
-- `${REVIEW_ID}` is stable for the whole review (generated at Step 2).
-- `${ATTEMPT_ID}` is a **new** 6-digit random integer generated immediately before writing the prompt for this launch. Generate a different value for the initial exec, any retry of the initial exec, each resume in Step 7, and any fresh-exec fallback. Do NOT reuse an earlier launch's ATTEMPT_ID within the same review.
-
-The comment is ignored by Codex as content but becomes part of the rollout transcript on disk. Check 4 below positively binds the rollout to THIS launch by grepping the rollout JSONL for the exact `ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID}` string. Attempt-scoping eliminates same-review retry ambiguity (a timed-out first attempt leaves a rollout with the OLD attempt id; the retry's fallback only matches the NEW one).
-
-**Prompt for plan review:**
+**Prompt body for plan review:**
 
 ```
-<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID} -->
 <role>
 You are a senior adversarial reviewer of implementation plans.
 Your job is to break confidence in the plan, not to validate it.
@@ -212,10 +198,9 @@ VERDICT: REVISE
 </output_format>
 ```
 
-**Prompt for code review (<= 50 files):**
+**Prompt body for code review (≤ 50 files):**
 
 ```
-<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID} -->
 <role>
 You are a senior adversarial code reviewer.
 Your job is to break confidence in the change, not to validate it.
@@ -290,9 +275,10 @@ VERDICT: REVISE
 </output_format>
 ```
 
-**Prompt for code review (> 50 files):**
+**Prompt body for code review (> 50 files):**
 
-Same prompt as above, but the `<task>` section without the file list:
+Same as ≤ 50 files above, but the `<task>` section is replaced with:
+
 ```
 <task>
 Review the code changes in this repo.
@@ -301,121 +287,134 @@ Run <git diff commands> to see changed files and full diffs.
 </task>
 ```
 
-**Prompt for code-vs-plan review:**
+**Prompt body for code-vs-plan review:**
 
-Same prompt as code review, but the `<task>` section is extended:
-```
-<task>
-Review the code changes in this repo against the implementation plan in <plan-path>.
-Changed files:
+Same as code review (≤ 50 or > 50 variant depending on file count), but:
+- `<task>` is extended to reference the plan file: `Review the code changes in this repo against the implementation plan in <plan-path>.`
+- `<attack_surface>` appends these three items:
+  ```
+  - Completeness: does the implementation cover all plan steps?
+  - Deviations: where does the code differ from the plan? Are deviations justified?
+  - Missing: what from the plan is not yet implemented?
+  ```
 
-<file list or empty if > 50>
+**Substitute template placeholders BEFORE writing to disk:**
 
-Changes include: <type>.
-Run <git diff commands> to see the full diffs.
-</task>
-```
+The inlined prompt bodies above contain template placeholders that main must resolve with real captured values before the Write. Placeholders per mode:
 
-And the following items are added to `<attack_surface>`:
-```
-- Completeness: does the implementation cover all plan steps?
-- Deviations: where does the code differ from the plan? Are deviations justified?
-- Missing: what from the plan is not yet implemented?
-```
+| Placeholder | Value source | Applies to |
+|---|---|---|
+| `${BASE_BRANCH}` | captured at Step 2 (code & code-vs-plan only) | code, code-vs-plan |
+| `<plan-path>` | captured at Step 3 | plan, code-vs-plan |
+| `<file list from --name-only>` | result of `git diff --name-only` + `git diff --cached --name-only` (or branch diff) from Step 3 | code, code-vs-plan (≤50 files only) |
+| `<unstaged changes / staged changes / ...>` | human-readable description derived from which diff commands had content | code, code-vs-plan |
+| `<git diff commands>` | the exact commands main determined at Step 3 (e.g. `git diff`, `git diff --cached`, `git diff ${BASE_BRANCH}...HEAD`) | code, code-vs-plan |
 
-**Launching Codex — command template:**
+Substitute `${BASE_BRANCH}` first (it appears nested inside `<unstaged changes / staged changes / ...>`), then compute the outer human-readable description based on which diffs have content. Main writes the substituted string to the Write tool — no template placeholders should remain in the body file sent to the runner.
 
-Flags:
-- `--json` — stdout becomes JSONL events (primary path for session-ID capture). In some sandbox configurations this stream ends up empty; the filesystem fallback in check 4 below handles that case.
-- `-m gpt-5.4` — model (overridden by `model:...` argument)
-- `-c model_reasoning_effort=high` — reasoning depth (overridden by `xhigh`, `low`, etc.)
-- `-s read-only` — reviewer only reads, does not write
-- `-C "${REPO_ROOT}"` — pin codex workdir to absolute repo root
-- `-o /tmp/codex-review-${REVIEW_ID}.md` — file for capturing final agent text
+**Capture user overrides for `CODEX_MODEL` / `CODEX_REASONING` at Step 1:**
 
-**Prompt delivery:** write the prompt to `/tmp/codex-prompt-${REVIEW_ID}.md` via **Write tool**, then feed it to codex via `cat file | codex exec ... -`. This avoids shell quoting issues with long XML prompts and is environment-portable (the alternative `- < file` stdin-redirect form is accepted by codex but fails with `EXIT=1` in some Claude Code sandbox configurations).
+The skill supports overrides like `/adversarial-review xhigh`, `/adversarial-review medium`, `/adversarial-review model:gpt-5.3-codex`. At Step 1, capture:
 
-**Plan Mode note:** Writing to `/tmp` via Write tool may trigger a permission prompt or exit Plan Mode. This is a known Claude Code limitation — Plan Mode restricts edits to the plan file only. If this happens, it does not affect review correctness: the review mode is already determined, and the skill only edits the plan file and `/tmp` temp files.
+- `CODEX_MODEL` — default `gpt-5.4`. Overridden by any argument matching `^model:(.+)$`; use the capture group.
+- `CODEX_REASONING` — default `high`. Overridden by any argument exactly matching `low`, `medium`, `high`, or `xhigh`.
 
-The prompt file (`/tmp/codex-prompt-${REVIEW_ID}.md`) just written serves as the anchor for the filesystem session-id fallback: its mtime is strictly earlier than any rollout file codex will create for this session, and it exists on disk without requiring any extra write. Check 4 below uses `find -newer` against this file instead of a timestamp arithmetic computation.
+These are passed into the runner YAML input block below.
+
+**Write the prompt body to disk via Write tool:**
+
+Write `/tmp/codex-body-${REVIEW_ID}.md` containing the substituted body text (no session marker — the runner adds it).
+
+> **Plan Mode note:** Writing to `/tmp` via Write tool may trigger a permission prompt or exit Plan Mode. This is a known Claude Code limitation. Additionally, dispatching a subagent under Plan Mode may inherit the restriction — empirical behavior documented in DESIGN.md §12.7.
+
+**Resolve the runner spec path:**
+
+The runner spec lives at `references/runner.md` within the skill's install directory. Main cannot reliably introspect Claude Code's skill-invocation header from inside its own context (there is no tool for reading one's own system prompt — any attempt would be a hallucination risk). Therefore the discovery uses only concrete filesystem checks, in this priority order:
+
+1. **User-scoped install** (primary): check `~/.claude/skills/adversarial-review/references/runner.md`:
 
 ```bash
-cat /tmp/codex-prompt-${REVIEW_ID}.md | timeout 600 codex exec --json \
-  -m gpt-5.4 \
-  -c model_reasoning_effort=high \
-  -s read-only \
-  -C "${REPO_ROOT}" \
-  -o /tmp/codex-review-${REVIEW_ID}.md \
-  - \
-  > /tmp/codex-stdout-${REVIEW_ID}.jsonl \
-  2>/tmp/codex-stderr-${REVIEW_ID}.txt
+ls ~/.claude/skills/adversarial-review/references/runner.md 2>/dev/null
 ```
 
-> **CRITICAL — the Bash tool result is NOT the review.** stdout is redirected to `/tmp/codex-stdout-${REVIEW_ID}.jsonl` (machine-readable JSONL events when populated, empty when the sandbox suppresses it — either way, never human-readable review text). The human-readable review exists ONLY in `/tmp/codex-review-${REVIEW_ID}.md`. Do not attempt to extract review text from the Bash result — there is none.
+If exit 0, set `RUNNER_SPEC_PATH` to the expanded absolute path and proceed.
 
-**Important:**
-- Always wrap `codex exec` in `timeout 600` (10 minutes). If Codex hangs — the command exits with code 124.
-- Use `timeout: 620000` parameter in Bash tool for headroom.
-- The command is **synchronous**: when it returns, all four files (`-o`, stdout jsonl, stderr, prompt) are in their final state. Do **NOT** use a poll-loop.
-- With `--json`, stderr is empty on success. It contains content only on errors (e.g. "Failed to write last message file ..."). Use stderr for diagnostics, NOT for session-id capture.
+2. **Plugin-marketplace install** (secondary): Claude Code's plugin system installs skills at paths like `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/skills/adversarial-review/`. Glob to find it:
 
-**Post-launch strict check order (do each before moving to the next):**
+```bash
+ls ~/.claude/plugins/cache/*/*/*/skills/adversarial-review/references/runner.md 2>/dev/null | head -1
+```
 
-1. **Exit code.**
-   - `124` → timeout. Tell the user "Reviewer did not respond within 10 minutes" and offer retry. Retry does NOT consume the round counter; max 1 retry per round.
-   - `≠ 0 and ≠ 124` → launch error. Read `/tmp/codex-stderr-${REVIEW_ID}.txt` (if it exists), show its contents to the user, abort the skill.
-   - `0` → proceed.
+If the Glob returns one or more paths, take the first and set `RUNNER_SPEC_PATH`.
 
-2. **Stderr sanity (even on exit 0).** Read `/tmp/codex-stderr-${REVIEW_ID}.txt`.
-   - If file missing → redirect itself failed; tell user `Could not create stderr file — check /tmp writability`, abort.
-   - If file contains a line matching `^Error:` or `Failed to write` → codex reported an infrastructure failure despite exit 0. Show stderr to user, route to launch-failure retry (max 1 per round; after retry failure → hard abort).
-   - Otherwise → proceed.
+3. **Dev checkout** (tertiary): if neither above, try `$(git rev-parse --show-toplevel)/references/runner.md`:
 
-3. **Review file sanity.** Read `/tmp/codex-review-${REVIEW_ID}.md`. It must exist and contain a line matching `^VERDICT: (APPROVED|REVISE)$`; if REVISE, it must also contain at least one line matching `\[severity:\s*(critical|high|medium)` (a structured finding). The full semantic-check logic is in Step 5; do the same thing here.
-   - Fails → route to launch-failure retry (max 1 per round; after retry failure → hard abort). Do NOT capture `CODEX_SESSION_ID` — if the review itself is broken, the session is of no use.
-   - Passes with `VERDICT: APPROVED` → `CODEX_SESSION_ID` is not needed (no Step 7 resume will happen). Skip the capture below entirely and proceed to Step 5.
-   - Passes with `VERDICT: REVISE` → capture `CODEX_SESSION_ID` next (check 4).
+```bash
+REPO=$(git rev-parse --show-toplevel 2>/dev/null) && ls "$REPO/references/runner.md" 2>/dev/null
+```
 
-4. **Capture `CODEX_SESSION_ID` — two-tier.** Only reached when the review was valid AND the verdict is REVISE (Step 7 resume is about to happen).
+4. **Abort**: if no path yields a readable file, tell the user: `Could not locate references/runner.md. Expected locations: (1) ~/.claude/skills/adversarial-review/references/runner.md, (2) ~/.claude/plugins/cache/*/*/*/skills/adversarial-review/references/runner.md, (3) $(git rev-parse --show-toplevel)/references/runner.md. Re-install the skill.` Abort the skill.
 
-   **What you are looking for.** A UUID string (format `[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`) that identifies the codex session, so `codex exec resume <UUID>` in Step 7 can continue this conversation. Try the cheap source first, fall back to the filesystem only if needed.
+Save the resolved absolute path as `RUNNER_SPEC_PATH`.
 
-   **Primary: first line of JSONL stdout.** Read `/tmp/codex-stdout-${REVIEW_ID}.jsonl`. The expected first-line shape is:
-   ```json
-   {"type":"thread.started","thread_id":"<uuid>","...":...}
-   ```
+**Dispatch the runner subagent via Agent tool:**
 
-   - **First line parses as JSON AND has a valid `thread_id` UUID** → save as `CODEX_SESSION_ID`, proceed to Step 5.
-   - **Any other case** (file empty / 0 bytes, first line not valid JSON, JSON has no `thread_id`, `thread_id` is not a UUID, partial/garbage output) → fall through to the secondary path below. Do NOT save an empty or malformed `CODEX_SESSION_ID`.
+Read `${RUNNER_SPEC_PATH}` once (main thread). This is the subagent's full spec.
 
-   **Secondary: rollout content-match.** The primary fails for two independent reasons: (a) in some Claude Code sandbox configurations `--json` stdout is empty (0 bytes) even on exit 0 with populated `-o`; (b) partial or format-drifted output from a future codex version. In both cases the session is recoverable from disk: every `codex exec` writes a rollout file named `rollout-<ISO-timestamp>-<UUID>.jsonl` under `~/.codex/sessions/YYYY/MM/DD/` (see `DESIGN.md §2.3`). The trailing UUID in the filename is the session id — but blindly picking the newest rollout risks binding to a parallel codex invocation (silent corruption). To bind positively, the skill matches **both** (i) rollout mtime newer than the prompt file (timestamp anchor) AND (ii) rollout contains the session marker (content anchor).
+Invoke the Agent tool with:
+- `subagent_type: "general-purpose"`
+- `model: "haiku"`
+- `description: "Adversarial-review runner, round N"` (N is the current round number)
+- `prompt:` the concatenation of:
+  1. The full text of `references/runner.md` you just read (as instructions).
+  2. A blank line.
+  3. A literal YAML input block with the values substituted (use `CODEX_MODEL` and `CODEX_REASONING` — the codex-CLI model/effort; distinct from the subagent's own Haiku model):
 
-   Run this single POSIX-portable invocation, grepping for the **current launch's** `${REVIEW_ID}-${ATTEMPT_ID}` marker (not just `${REVIEW_ID}`):
+```yaml
+---
+REVIEW_ID: 1711872000-48217593
+REPO_ROOT: /home/dementev/sources/myproject
+OPERATION: initial
+CODEX_MODEL: gpt-5.4
+CODEX_REASONING: high
+PROMPT_BODY_PATH: /tmp/codex-body-1711872000-48217593.md
+RESULT_PATH: /tmp/codex-runner-result-1711872000-48217593.json
+---
+```
 
-   ```bash
-   find ~/.codex/sessions -name 'rollout-*.jsonl' -newer /tmp/codex-prompt-${REVIEW_ID}.md -exec grep -l 'ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID}' {} + 2>/dev/null
-   ```
+Substitute real values. `RESULT_PATH` always follows the pattern `/tmp/codex-runner-result-${REVIEW_ID}.json`.
 
-   Substitute the actual `REVIEW_ID` in the prompt path and the actual `REVIEW_ID-ATTEMPT_ID` combined marker in the grep pattern. `-newer FILE`, `-exec ... {} +`, and `grep -l` are all POSIX — works identically on Linux and macOS.
+**Do NOT run the Agent tool call in background.** Wait for the subagent to return. (Runner's own codex exec is also synchronous per runner Step R3.)
 
-   The output is zero or more rollout paths that (a) postdate our prompt file AND (b) contain this launch's specific marker. From the result:
+**Parse the subagent's response — two-channel protocol:**
 
-   - **Exactly one path** (the expected case) → this is our rollout. Extract the trailing UUID from the filename (the 36-char hex-and-dashes pattern above) and save as `CODEX_SESSION_ID`.
-   - **Zero paths** → **fail closed.** Either codex did not create a rollout, or something prevented the marker from reaching disk. We cannot safely guess. Before aborting, surface diagnostic context to the user: the contents of `/tmp/codex-stdout-${REVIEW_ID}.jsonl` (if non-empty), `/tmp/codex-stderr-${REVIEW_ID}.txt`, and the 3 most-recent rollout filenames (`ls -t ~/.codex/sessions/*/*/*/rollout-*.jsonl 2>/dev/null | head -3`). Then treat as launch failure, generate a **new** `ATTEMPT_ID` for the retry (so the retry's fallback won't match this launch's rollout if it later appears), rewrite the prompt with the new marker, retry once, then abort.
-   - **Multiple paths** → **fail closed.** This should not happen: `ATTEMPT_ID` is per-launch, so two rollouts sharing both `REVIEW_ID-ATTEMPT_ID` would require either a 10⁻⁶ collision on `ATTEMPT_ID` or a mistaken reuse. Do NOT pick arbitrarily — abort the round with a diagnostic listing all matching rollout paths. Silent session drift is worse than visible failure.
+Apply the regex `RUNNER_RESULT_AT:\s+(\S+)` (UNANCHORED — matches anywhere in the Agent tool's result text, tolerant of markdown fences and preamble). Take the first match's capture group as the result-file path.
 
-   **Why positive-bind instead of newest-by-mtime:** Round 6 of adversarial review flagged that picking newest-by-mtime allows a parallel codex invocation (user running codex in another terminal, CI job, etc.) to create a newer rollout during the race window, which our secondary would silently pick — Step 7 resume would succeed against that wrong session, and the skill would apply fixes informed by an unrelated review. Positive content-match with per-launch `ATTEMPT_ID` eliminates this both cross-review (parallel codex) and intra-review (retries): only a rollout containing **this launch's specific** marker is accepted; everything else is invisible.
+If the regex finds NO match in the subagent's response, fall back to a Glob for the deterministic path `/tmp/codex-runner-result-${REVIEW_ID}.json` — REVIEW_ID is already known to main. If Glob also returns nothing, treat as `infra_error` with `errors: "runner did not write result file at deterministic path and did not emit RUNNER_RESULT_AT line"` and abort.
 
-**Where `thread_id` / session id is NOT:**
+Read the file at the resolved path. Parse as JSON. Extract `result`, `verdict`, `review_file`, `codex_session_id`, `errors`, `user_warning`, `archived_stdout`, `archived_stderr`.
 
-- NOT in `/tmp/codex-review-${REVIEW_ID}.md` (only contains the final agent text)
-- NOT in stderr file under `--json` (empty on success; error text only on failure)
-- NOT in the middle or tail of stdout — only the **first line** of the JSONL file (when it is populated at all)
+**If `user_warning` is non-null, surface it as a SEPARATE short user-visible message BEFORE the Step 5 verbatim-review message.** Format:
 
-**Notes:**
-- Default model: `gpt-5.4` with `model_reasoning_effort=high`. User can override via arguments.
-- Always `-s read-only` — reviewer must not write files.
-- Do **NOT** run in background.
+```
+⚠ <user_warning contents>
+```
+
+Emit this on its own turn — do NOT concatenate into the Step 5 `## Adversarial Review — Round N` header message (that message's body must remain the review's verbatim content, nothing else). Emit the warning FIRST, then the Step 5 message. This preserves both the pre-refactor §2.4.4 "no-op refresh" diagnostic AND the Step 5 verbatim-display contract.
+
+Dispatch based on `result`:
+
+| `result` value | Main thread action |
+|---|---|
+| `success` | Save `codex_session_id` (keep prior if `null` per §2.4.4). Surface `user_warning` if set. Proceed to Step 5. |
+| `timeout` | **TERMINAL — do NOT re-dispatch.** Runner already attempted twice internally (R4.1 + R5 retry = 2 × 10min). Tell user: "Reviewer timed out after two attempts (20 minutes total)." Abort the skill. User can re-invoke `/adversarial-review` to start a fresh review. |
+| `launch_failure` | **TERMINAL — do NOT re-dispatch.** The runner already retried once internally (Step R5). Show `errors` to user, abort the skill. This keeps the total-attempts-per-round invariant at 2 (matches pre-refactor: 1 initial + 1 retry). |
+| `infra_error` | Show `errors` to user (infrastructure: /tmp not writable, stderr file missing, RUNNER_RESULT_AT line absent). Abort. |
+| `input_error` | Bug in orchestration. Show `errors` to user. Abort. |
+
+**Round-level attempt invariant:** exactly ONE runner dispatch per round. Every failure result is terminal at main. The runner owns the full retry budget (≤2 attempts per dispatch, internal) regardless of failure type. Total codex invocations per round ≤ 2.
+
+> **CRITICAL — main thread does NOT read stdout/stderr/JSONL/rollout files BY CONTENT.** Those live and die inside the subagent. Main reads: the runner result JSON at `RESULT_PATH`, the review file at `review_file`, and nothing else from `/tmp/codex-*`. Archival `mv` (on resume failure) is done by the runner, not main — main never references `/tmp/codex-stdout-*` or `/tmp/codex-stderr-*` in any Bash argv.
 
 ### Step 5: Read the review, show it, then check the verdict
 
@@ -436,7 +435,7 @@ If any check fails → this is a **launch failure** (model produced no actionabl
 
 **3. Show the review to the user. This is mandatory and blocking.**
 
-> Your VERY NEXT MESSAGE to the user must begin with the header below, followed by the file contents **verbatim**. Not "I've received the review", not "The reviewer said:", not a summary — the literal file content.
+> Your next user-visible message that is NOT a one-line `⚠ <warning>` diagnostic must begin with the header below, followed by the file contents **verbatim**. Not "I've received the review", not "The reviewer said:", not a summary — the literal file content.
 >
 > Do NOT wrap the review in a code fence (the review is already markdown, and an outer fence would break on inner fences).
 >
@@ -458,7 +457,7 @@ Message format:
 
 ### Step 6: Apply fixes
 
-> **Precondition gate (check first).** Before calling any Edit, Write, or other fix-applying tool: confirm that you have already sent a user-visible message in THIS round whose body contains the verbatim review text. If you have not — STOP. Go back to Step 5 and send the review message now. This is the same rule that protects the "user sees the review" contract; a literal reader may otherwise slip past it.
+> **Precondition gate (check first).** Before calling any Edit, Write, or other fix-applying tool: confirm that you have already sent a user-visible message in THIS round whose body contains the verbatim review text (short `⚠ <user_warning>` diagnostic messages do NOT count). If you have not — STOP. Go back to Step 5 and send the review message now. This is the same rule that protects the "user sees the review" contract; a literal reader may otherwise slip past it.
 
 Based on the reviewer's findings:
 
