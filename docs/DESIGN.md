@@ -1440,3 +1440,53 @@ the current generation. Rules of thumb:
 - Codex CLI command-line reference: https://developers.openai.com/codex/cli/reference
 - Codex GitHub issue #12538 (resume `-o` support): https://github.com/openai/codex/issues/12538
 - Codex GitHub issue #14544 (resume exec sessions): https://github.com/openai/codex/issues/14544
+
+## §12. Subagent architecture
+
+### §12.1 The residue problem
+
+Before this split, the entire skill ran in the main Claude thread. Each round's `Bash` tool call produced result content that Claude's context caches: the codex stdout JSONL stream (often 200-500KB when populated), the stderr file (small but growing), and the grep-over-rollout that reads file content. Across 5 rounds and a long conversation, cache-read residue accumulated to ~48M tokens per invocation.
+
+### §12.2 The split
+
+Claude Code's Agent tool dispatches a fresh subagent with its own isolated context. When the subagent returns, its context is discarded; only its final text message crosses to main. By making the runner subagent own every codex-exec artifact and return only a ~1KB JSON summary file plus the small review file path, the main thread no longer pays the residue tax.
+
+The runner uses a two-channel protocol: the authoritative structured result is written to `/tmp/codex-runner-result-${REVIEW_ID}.json`, and the runner's final message is a single `RUNNER_RESULT_AT: <path>` line. Main extracts the path with a tolerant regex (markdown fences and minor wrapping do not break parsing) and reads the JSON file directly. This avoids the brittle "raw JSON in message" contract that Haiku's conversational output style would otherwise stress.
+
+### §12.3 Retry budget — single owner
+
+Retry lives in the runner alone, across ALL failure types (launch_failure, timeout, stderr-infrastructure-error). Runner retries once internally (same ATTEMPT_ID-rotation as pre-refactor's round-level retry). Main treats EVERY failure result as terminal-for-this-round: on the initial Step-4 dispatch, terminal = abort; on the Step-7 resume dispatch, terminal = route to fallback (fresh-exec, which is a new round with its own budget).
+
+**The full invariant:** *exactly 2 codex invocations per round, maximum, across all failure types.* The pre-refactor skill had the same budget; the refactor does not loosen it. Putting the retry at a single layer (runner) prevents the worst-case compounding that would occur if main also re-dispatched on failure — specifically Round-2 finding #1 identified that a user-offered timeout retry → fresh-exec cascade could produce up to 6 invocations per round if retry logic existed at multiple layers. Terminal-at-main closes this lane.
+
+Fresh-exec fallback is a *separate round* that consumes a round counter slot and gets its own fresh 2-attempts budget; this matches pre-refactor §2.4 where fresh-exec also counted as one round.
+
+### §12.4 Archival ownership
+
+Resume-to-fresh-exec fallback requires archiving the failed-resume stdout/stderr so they survive the next dispatch's file-reuse. Pre-refactor, main did this via its own `mv`. Post-refactor the runner does it inside Step R5 (only on resume failure). Rationale: main never references `/tmp/codex-stdout-*` or `/tmp/codex-stderr-*` paths in its own Bash argv, strengthening the isolation claim (no leak by path-reference). Archived paths are returned in the result JSON as `archived_stdout` / `archived_stderr`; main includes them in Step 9 cleanup per its unchanged `rm` glob.
+
+### §12.5 Model choice
+
+The runner is a pure pipeline executor: parse inputs, call Bash, validate output, retry once, archive on resume failure, write result JSON. No code understanding, no severity judgment, no review interpretation. Haiku 4.5 is sufficient and ~15× cheaper per token than Opus. The main thread (Opus) keeps all judgment work (applying fixes, deciding round progression, user interaction).
+
+To avoid confusion, the runner's input schema uses `CODEX_MODEL` (the model codex CLI launches) — distinct from the runner's OWN model, which is passed via the Agent tool's `model: "haiku"` parameter. The names are intentionally non-overlapping.
+
+### §12.6 Invariants preserved
+
+The attempt-scoped `ADVERSARIAL-REVIEW-SESSION` marker (round-7 finding) and positive content-bind on rollout files (round-6 finding) both live in the runner. The orchestration-level invariants (5-round cap, resume-before-fresh-exec preference, not-verified terminal state, §2.4.4 user-facing warning on secondary-find zero) all stay in main or flow through the runner's `user_warning` channel.
+
+### §12.7 Plan Mode inheritance (populated by Task 7 Step 4 — hypothesis until verified)
+
+> **Status:** this subsection is empirically determined by Task 7 Step 4's Plan Mode smoke test. Until that task runs and the implementer updates this subsection with observed behavior, treat every claim here as a HYPOTHESIS, not documented fact.
+
+**Hypothesis to test:** Plan Mode restrictions propagate from main to any subagent main dispatches; the subagent inherits limitations on Write/Edit/Bash. If this holds:
+- Main's Write to `/tmp/codex-body-*.md` may trigger a permission prompt or exit Plan Mode.
+- The runner's Writes to `/tmp/codex-prompt-*.md` (Step R2, including the mtime-bump repeat Write) may also trigger prompts.
+- The runner's `codex exec` (read-only sandbox) should be unaffected since it writes nothing to the user's repo.
+
+**What Task 7 Step 4 must determine:**
+1. Does dispatching the Agent tool from Plan Mode work (is it blocked, does it prompt, does it just work)?
+2. Does the subagent inherit Plan Mode, or does it run as unrestricted?
+3. If Plan Mode propagates, does the subagent's Write (for the repeat-Write mtime bump) fail, prompt, or succeed silently?
+
+**After Task 7 Step 4 runs, REWRITE this subsection with the observed answers.** Delete the hypothesis framing and state the observed behavior as fact. Until then, anyone reading §12.7 should understand it is speculative.
