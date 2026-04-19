@@ -114,7 +114,7 @@ Bash tool `timeout` parameter: `620000` (10 min + headroom).
 For `OPERATION=resume`:
 
 ```bash
-cd '${REPO_ROOT}' && cat /tmp/codex-resume-prompt-${REVIEW_ID}.md | timeout 600 codex exec resume --json \
+cd "${REPO_ROOT}" && cat /tmp/codex-resume-prompt-${REVIEW_ID}.md | timeout 600 codex exec resume --json \
   ${CODEX_SESSION_ID} \
   -o /tmp/codex-review-${REVIEW_ID}.md \
   - \
@@ -143,14 +143,29 @@ Do these in order. Stop and return as soon as one fails.
 - File missing or empty → route to retry (Step R5).
 - Does NOT contain a line matching `^VERDICT: (APPROVED|REVISE)$` → route to retry.
 - Verdict is `REVISE` AND file contains NO line matching `\[severity:\s*(critical|high|medium)` → route to retry (reviewer format drift).
-- Verdict is `APPROVED` → return `{"result":"success","verdict":"APPROVED","review_file":"/tmp/codex-review-${REVIEW_ID}.md","codex_session_id":null,"attempt_id":"${ATTEMPT_ID}","errors":null}`.
+- Verdict is `APPROVED` → write this EXACT JSON object to `${RESULT_PATH}` and return the `RUNNER_RESULT_AT:` line:
+
+  ```json
+  {
+    "result": "success",
+    "verdict": "APPROVED",
+    "review_file": "<absolute path to /tmp/codex-review-REVIEW_ID.md, substituted>",
+    "codex_session_id": null,
+    "attempt_id": "<the current ATTEMPT_ID string>",
+    "errors": null,
+    "archived_stdout": null,
+    "archived_stderr": null,
+    "user_warning": null
+  }
+  ```
+
 - Verdict is `REVISE` → proceed to Check R4.4.
 
 **Check R4.4: Capture session id — two tiers.**
 
 *Primary — first line of JSONL stdout:*
 
-Read `/tmp/codex-stdout-${REVIEW_ID}.jsonl`. If the first line parses as JSON with a `thread_id` field matching `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`, save as `CODEX_SESSION_ID` and return success. Otherwise fall through.
+Read `/tmp/codex-stdout-${REVIEW_ID}.jsonl`. If the first line parses as JSON with a `thread_id` field matching `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`, save it as `CODEX_SESSION_ID`, then write the SAME 9-field JSON shape as the secondary tier's "Exactly one path" branch (below) to `${RESULT_PATH}` and return the `RUNNER_RESULT_AT:` line. Otherwise fall through to the secondary tier.
 
 *Secondary — rollout content-match:*
 
@@ -199,7 +214,7 @@ find ~/.codex/sessions -name 'rollout-*.jsonl' -newer <anchor> -exec grep -l 'AD
 
 (The two `success` JSON shapes are inlined above per branch. Every success path through R4.4 MUST emit a complete 9-field JSON object — never rely on implicit defaults, never leave a field omitted, never write a literal placeholder like `"<uuid>"` in the output.)
 
-### Step R5: Retry once on launch failure (TERMINAL — main will not re-dispatch)
+### Step R5: Retry once on any failure (TERMINAL — main will not re-dispatch)
 
 You have at most ONE retry per dispatch. This retry is the ONLY retry in the system — main treats your `launch_failure` result as terminal and will NOT re-dispatch you. Track the retry counter in your reasoning.
 
@@ -207,7 +222,7 @@ On retry:
 1. Generate a NEW `ATTEMPT_ID` (the old one stays in the old rollout; we must not let the grep match it again).
 2. Rewrite the prompt file with the new marker (using the Write tool; the write itself bumps mtime — do NOT use Bash `touch`, which may be gated by inherited Plan Mode on the subagent).
 3. Re-launch (same Step R3 command, still `run_in_background: false`).
-4. Re-run checks R4.1–R4.4.
+4. Re-run checks R4.1–R4.4. **This is the second and final attempt.** On this re-run, any check's "route to retry" outcome becomes terminal — do NOT re-enter R5. Apply the terminal-result rule below (timeout if exit 124 again, else launch_failure).
 
 If the second attempt also fails any check:
 - For `OPERATION=resume`: before writing the `launch_failure` result, **archive the diagnostic files** (main will need them for the fallback fresh-exec which reuses the same base paths):
@@ -221,7 +236,10 @@ Then write the result with `archived_stdout` and `archived_stderr` set to the `-
 
 - For `OPERATION=initial` or `OPERATION=fresh-exec`: no archival needed (there is no next attempt within this REVIEW_ID to collide). Leave files at their normal paths for main's diagnostic read (main is allowed to `mv`/`rm` by path; it just doesn't read content).
 
-Write the `launch_failure` result (with stderr tail ≤500 chars in `errors`) and return the `RUNNER_RESULT_AT: ...` line.
+Write the appropriate terminal result and return the `RUNNER_RESULT_AT: ...` line:
+- Second attempt exit was 124 → write `{"result":"timeout","errors":"codex exceeded 600s on both attempts", ...}` (9 fields, all others null as applicable).
+- Any other failure mode → write `launch_failure` with stderr tail (≤500 chars) in `errors`.
+In both cases, fill all 9 fields (set `archived_stdout`/`archived_stderr` only when the archival mv in the OPERATION=resume branch ran, else null; set `user_warning` null; set `verdict` null; set `review_file` to `/tmp/codex-review-${REVIEW_ID}.md` only if that file contains a valid VERDICT line, else null).
 
 ### Step R6: Cleanup
 
