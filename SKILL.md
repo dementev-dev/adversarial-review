@@ -355,7 +355,7 @@ REPO=$(git rev-parse --show-toplevel 2>/dev/null) && ls "$REPO/references/runner
 
 4. **Abort**: if no path yields a readable file, tell the user: `Could not locate references/runner.md. Expected locations: (1) ~/.claude/skills/adversarial-review/references/runner.md, (2) ~/.claude/plugins/cache/*/*/*/skills/adversarial-review/references/runner.md, (3) $(git rev-parse --show-toplevel)/references/runner.md. Re-install the skill.` Abort the skill.
 
-Save the resolved absolute path as `RUNNER_SPEC_PATH`.
+Save the resolved absolute path as `RUNNER_SPEC_PATH`. Do NOT attempt to extract the path from any "Base directory for this skill:" line in the conversation — that line is a system injection Claude cannot reliably read from inside its own context.
 
 **Dispatch the runner subagent via Agent tool:**
 
