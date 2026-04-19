@@ -479,17 +479,17 @@ Based on the reviewer's findings:
 
 ### Step 7: Resubmit to Codex (Rounds 2-5)
 
-**Resume is the primary path.** Saves tokens and preserves session context. A fresh `codex exec` without resume is an **emergency fallback** — costly in tokens, and requires rebuilding prior-round context.
+**Resume is the primary path.** Saves tokens and preserves session context. A fresh `codex exec` without resume is an **emergency fallback** when resume itself fails.
 
-**1. Write the resume prompt** to `/tmp/codex-resume-prompt-${REVIEW_ID}.md` via **Write tool**. Use a separate file from the initial prompt so round-1 material remains available for diagnostics. **Generate a fresh `${ATTEMPT_ID}` for this resume launch** (different from the initial exec's ATTEMPT_ID and from every prior resume's ATTEMPT_ID). The resume prompt must begin with the per-launch marker:
+**Step 7.1: Write the resume prompt body to disk.**
+
+Write `/tmp/codex-resume-body-${REVIEW_ID}.md` containing:
 
 ```
-<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID} -->
-
 I've revised based on your feedback.
 
 Here's what I changed:
-[List of fixes]
+[List of fixes from Step 6]
 
 Re-review with the same adversarial stance. Focus on:
 1. Whether my fixes actually resolve the reported issues
@@ -498,56 +498,44 @@ Re-review with the same adversarial stance. Focus on:
 End with VERDICT: APPROVED or VERDICT: REVISE
 ```
 
-**2. Run resume.** Resume does NOT accept `-C`, so prefix the command with an explicit `cd` to `${REPO_ROOT}` (captured at Step 2). Use single quotes around `${REPO_ROOT}` — the path was validated at Step 2 to contain no single quotes.
+Substitute the fixes list from Step 6 (one bullet per finding addressed). Do NOT include the session marker — the subagent adds it.
 
-The resume prompt file (`/tmp/codex-resume-prompt-${REVIEW_ID}.md`) acts as the anchor for this resume's filesystem fallback, the same way the initial prompt file anchors Step 4. Launch resume via the `cat | ... -` pattern:
+**Step 7.2: Dispatch the runner subagent for resume.**
 
-```bash
-cd '${REPO_ROOT}' && cat /tmp/codex-resume-prompt-${REVIEW_ID}.md | timeout 600 codex exec resume --json \
-  ${CODEX_SESSION_ID} \
-  -o /tmp/codex-review-${REVIEW_ID}.md \
-  - \
-  > /tmp/codex-stdout-${REVIEW_ID}.jsonl \
-  2>/tmp/codex-stderr-${REVIEW_ID}.txt
+Same Agent tool invocation as Step 4 (runner spec + YAML input block). Reuse the `RUNNER_SPEC_PATH` resolved in Step 4 (do not re-resolve). Input block:
+
+```yaml
+---
+REVIEW_ID: <same as initial round>
+REPO_ROOT: <same>
+OPERATION: resume
+CODEX_MODEL: <same>
+CODEX_REASONING: <same>
+PROMPT_BODY_PATH: /tmp/codex-resume-body-<REVIEW_ID>.md
+RESULT_PATH: /tmp/codex-runner-result-<REVIEW_ID>.json
+CODEX_SESSION_ID: <uuid from previous round's runner result>
+---
 ```
 
-Use `timeout: 620000` in Bash tool parameters.
+**Step 7.3: Parse the two-channel result.**
 
-**Note:** Resume does NOT accept `-s` (sandbox — inherited from the original session; always `read-only` here) or `-C` (see above). It DOES accept `--json`, `-o`, `-m`, and `-i`.
+Extract `RUNNER_RESULT_AT:` line (same tolerant regex + Glob fallback as Step 4), read the JSON file, extract fields. If `user_warning` is non-null, emit it as its own `⚠ <user_warning>` message BEFORE any other action (including before the Step 5 verbatim review) — see Step 4's user_warning rule.
 
-**3. Post-resume strict check order (do each before moving to the next):**
+| `result` value | Main thread action |
+|---|---|
+| `success`, verdict `APPROVED` | Read `review_file`, go to Step 5 (it will dispatch to Step 8 on APPROVED). |
+| `success`, verdict `REVISE` | Save new `codex_session_id`. If the subagent returned null (zero-find resume), keep the prior id per §2.4.4 — `user_warning` will already have been surfaced. Go to Step 5. |
+| `timeout` | **TERMINAL for this round** — runner already attempted twice. Route to fallback below. (Fresh-exec is a NEW round from the 5-round counter — its own ≤2-attempts budget applies.) No user-offered retry; that would compound. |
+| `launch_failure` | **TERMINAL for this round** — runner already retried once internally. Route to fallback below (runner already archived stdout/stderr to `-failed-resume.*` — paths in `archived_stdout` / `archived_stderr`). |
+| `infra_error` | Show `errors` to user, abort. |
 
-1. **Exit code.**
-   - `124` → timeout. Tell the user and offer retry. Retry does not consume the round counter.
-   - `≠ 0` → resume failed. Do NOT update `CODEX_SESSION_ID`. Route to fallback.
-   - `0` → proceed.
+**Round-level attempt invariant:** exactly ONE runner dispatch per resume round. Every failure result routes to fallback (not re-dispatch within the same round). Fallback's fresh-exec dispatch consumes a NEW round from the 5-round counter, which has its own independent 2-attempts-per-round budget. Total codex invocations per round ≤ 2 regardless of failure type — matches pre-refactor; closes Round-2 finding #1.
 
-2. **Stderr error check** (exit 0 can hide `Error:` or `thread/resume failed`). Read `/tmp/codex-stderr-${REVIEW_ID}.txt`:
-   - If file is missing → redirect failed; tell user `/tmp not writable`, abort.
-   - If contains a line matching `thread/resume failed` or `^Error:` → route to fallback. Do NOT update `CODEX_SESSION_ID`.
+**Step 7.4: Fallback chain** — triggered by `launch_failure` or repeated `timeout` from the runner.
 
-3. **Review file sanity.** Read `/tmp/codex-review-${REVIEW_ID}.md` and apply the same checks as Step 5.2:
-   - Missing / empty / no `^VERDICT: (APPROVED|REVISE)$` line / REVISE without `[severity:` lines → route to fallback. Do NOT update `CODEX_SESSION_ID`.
+*Severity classification:* parse the PREVIOUS round's review (kept in conversation history from Step 5.3's verbatim display) for the highest `[severity:` level. Default to `critical` if zero matches (format drift).
 
-**4. Only if all three checks pass AND the verdict is REVISE** → refresh `CODEX_SESSION_ID` using two tiers (primary = first JSONL line of `/tmp/codex-stdout-${REVIEW_ID}.jsonl`; secondary = rollout file that is both newer than `/tmp/codex-resume-prompt-${REVIEW_ID}.md` AND contains the `ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID}` marker for THIS resume's ATTEMPT_ID, with UUID extracted from the basename — same positive-binding approach as Step 4 check 4 but anchored on the resume prompt). On APPROVED verdict, skip the refresh — there is no round N+1.
-
-> **Important — NOT identical to Step 4 check 4 on the failure side.** Step 4 check 4 treats "no matching rollout" as a launch failure because in Step 4 the session id is needed for resume to even happen. In Step 7 the resume has **already succeeded** (checks 1-3 passed), and per `DESIGN.md §2.4.4` the thread id does not rotate across resumes — so if both tiers yield nothing here, **do NOT abort and do NOT retry**: keep the previous `CODEX_SESSION_ID` unchanged, log a one-line warning to the user (`"Step 7 session-id refresh: both tiers empty, continuing with previous ID per §2.4.4"`), and continue to Step 5.
-
-After the refresh (or the no-op refresh on zero-find), return to **Step 5** with the new review.
-
----
-
-**Fallback chain** — triggered when any of the three resume checks above fails.
-
-> `--last` is deliberately NOT used. `codex exec resume --last` picks the newest session in the current cwd, which may be an unrelated codex invocation and cannot be distinguished from the intended one until after damage is done.
-
-**Severity classification** — parse the **previous** round's review file (which is still in `/tmp/codex-review-${REVIEW_ID}.md` only if the resume overwrote the current-round result but not the previous-round; in general, rely on **conversation history** where prior rounds were shown verbatim per Step 5.3).
-
-Parse case-insensitively for `\[severity:\s*(critical|high|medium)\b` and take the highest. If zero matches (reviewer format drift), default to `critical` to force re-verification in non-interactive mode.
-
-**Interactive mode** (you received a direct user message earlier in this session, not a trigger/cron):
-
-Ask the user:
+*Interactive mode* (direct user message earlier in this session): ask the user:
 
 ```
 Resume failed — the reviewer's re-review did not produce a usable result.
@@ -558,57 +546,15 @@ Options:
 (b) Conclude the review — show current findings as NOT VERIFIED
 ```
 
-- (a) → fresh-exec path below.
-- (b) → Step 8 with the **not-verified** terminal state (same as maximum-reached, but with a different header).
+*Non-interactive mode:*
+- Max severity `critical` or `high` → fresh exec automatically.
+- Max severity `medium` only → Step 8 with the not-verified terminal state.
 
-**Non-interactive mode** (headless, scheduled run, no direct user message in this conversation):
+*Fresh-exec dispatch:* build a new PROMPT_BODY that is the original Step 4 prompt for the current mode, followed by sections `## Previous review rounds` (verbatim round-1..N reviews + fixes from conversation history) and `## Current state of the artifact`. Write to `/tmp/codex-body-${REVIEW_ID}.md` (overwriting the original).
 
-- Max severity `critical` or `high` → fresh exec automatically. The risk of silently skipping a serious finding outweighs the token cost.
-- Max severity `medium` only → Step 8 with the **not-verified** terminal state.
+**Archival note:** if the fallback was triggered by `launch_failure`, the runner already archived failed-resume stdout/stderr to `-failed-resume.*` paths during Step R5 — main does NOT need to `mv` anything. If triggered by repeated `timeout`, no archival happened (no second codex invocation produced useful diagnostics); main can proceed directly. Either way, main never touches `/tmp/codex-stdout-*` or `/tmp/codex-stderr-*` itself.
 
-**Fresh-exec prompt template.** The lead rebuilds prior-round context from the conversation (all prior rounds were shown verbatim in Step 5.3 user messages, so they are available in context). Generate a fresh `${ATTEMPT_ID}` for this fresh-exec launch, then begin the prompt with the per-launch marker:
-
-```
-<!-- ADVERSARIAL-REVIEW-SESSION: ${REVIEW_ID}-${ATTEMPT_ID} -->
-[Original adversarial prompt for the current mode, from Step 4]
-
-## Previous review rounds
-
-### Round 1 findings (verbatim from earlier in this conversation):
-<copy the round-1 review text that you already output as a user message>
-
-### Round 1 fixes:
-<copy the round-1 fixes list you output in Step 6>
-
-### Round 2 findings (verbatim):
-<...>
-
-### Round 2 fixes:
-<...>
-
-## Current state of the artifact
-[plan mode] Full current plan text: <insert>
-[code mode] Run `git diff` from ${REPO_ROOT} to see the current changes.
-
-Re-review. Focus on whether prior fixes resolved the reported issues and on any NEW issues introduced by the fixes.
-
-End with VERDICT: APPROVED or VERDICT: REVISE.
-```
-
-**Archive failed-resume diagnostics BEFORE launching the fresh exec** (the fresh exec reuses the same stderr/stdout paths and would overwrite them):
-
-```bash
-mv /tmp/codex-stdout-${REVIEW_ID}.jsonl /tmp/codex-stdout-${REVIEW_ID}-failed-resume.jsonl 2>/dev/null
-mv /tmp/codex-stderr-${REVIEW_ID}.txt /tmp/codex-stderr-${REVIEW_ID}-failed-resume.txt 2>/dev/null
-```
-
-If the fresh exec later needs investigating, both the failed-resume trail (`*-failed-resume.*`) and the fresh-exec trail (the unsuffixed files) survive side-by-side. Cleanup at Step 9 removes both (the cleanup glob `/tmp/codex-*-${REVIEW_ID}*` covers the suffixed variants).
-
-Write the fresh-exec prompt to `/tmp/codex-prompt-${REVIEW_ID}.md` (overwriting the original is acceptable).
-
-Launch using the **same command template as Step 4** (`cat file | timeout 600 codex exec --json ... -` with `-C`, `-o`, stdout jsonl, stderr). Because this fresh-exec path **overwrites** `/tmp/codex-prompt-${REVIEW_ID}.md` with new content just written above, that file's mtime is automatically the post-write moment — it serves as the `-newer` anchor for the two-tier secondary session-id capture on the fresh exec's rollout, the same way Step 4 uses it on the initial exec's rollout. Apply the same post-launch strict check order including the two-tier session-id capture, then return to **Step 5**.
-
-> This fresh exec consumes one round from the 5-round counter — same as a successful resume would have.
+Dispatch the runner subagent with `OPERATION=fresh-exec` (same input schema, new PROMPT_BODY_PATH pointing at the rebuilt prompt). The fresh-exec consumes one round from the 5-round counter. Return to Step 5 with the new review.
 
 ### Step 8: Final result
 
