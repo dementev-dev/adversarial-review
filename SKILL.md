@@ -363,7 +363,7 @@ Save the resolved absolute path as `RUNNER_SPEC_PATH`. Do NOT attempt to extract
 
 Invoke the Agent tool with:
 - `subagent_type: "general-purpose"`
-- `model: "haiku"`
+- `model: "sonnet"`
 - `description: "Adversarial-review runner, round N"` (N is the current round number)
 - `prompt:` a short bootstrap instruction + YAML input block (no inlined runner.md):
 
@@ -641,10 +641,10 @@ Do NOT delete plan files that existed before the review (only temp files created
 - **Codex-exec mechanics live in the runner subagent** (`references/runner.md`): ATTEMPT_ID generation, prompt-with-marker writing (with a repeated Write call for mtime freshness — NOT Bash `touch`, which may be gated by inherited Plan Mode), synchronous launch, strict checks, two-tier session-id capture with positive content-bind, ONE internal retry on ANY failure type (launch_failure, timeout, stderr-infra), archival mv on resume failure. Main thread never reads codex stdout/stderr/rollout file CONTENT, and never references those paths in its own Bash argv.
 - **Two-channel result protocol.** Runner writes structured JSON to `/tmp/codex-runner-result-${REVIEW_ID}.json` (authoritative) AND returns a single `RUNNER_RESULT_AT: <path>` line as its final message. Main extracts the path via regex (tolerant to markdown fences / minor wrapping), reads the JSON, and never relies on raw-JSON-in-message parsing.
 - **Main thread reads only**: the runner result JSON at `RESULT_PATH` and the review file at `review_file`. Main does NOT Read `references/runner.md` — the runner spec is passed by path to the subagent, which Reads it itself. No other `/tmp/codex-*` reads.
-- **Runner is dispatched via Agent tool** with `subagent_type: general-purpose, model: haiku`. Agent tool call is synchronous (not `run_in_background`).
+- **Runner is dispatched via Agent tool** with `subagent_type: general-purpose, model: sonnet`. Agent tool call is synchronous (not `run_in_background`).
 - **ALL runner failure results are TERMINAL at main** (`launch_failure`, `timeout`, `infra_error`, `input_error`). Runner retries once internally on ANY failure. Main does NOT re-dispatch and does NOT offer the user a retry — those lanes would compound retries across layers. Total codex invocations per round ≤ 2 (matches pre-refactor invariant: 1 initial + 1 retry). Fresh-exec fallback is a NEW round with its own independent 2-attempts budget.
 - **`user_warning` from the runner must be surfaced to the user** on a single line BEFORE any other action. This preserves the pre-refactor §2.4.4 "both tiers empty, continuing with previous ID" diagnostic.
-- **`CODEX_MODEL` / `CODEX_REASONING`** in the runner input schema refer to the model codex CLI launches (e.g. `gpt-5.4`). The runner's OWN model is Haiku, set via Agent tool's `model: "haiku"`. Do NOT conflate.
+- **`CODEX_MODEL` / `CODEX_REASONING`** in the runner input schema refer to the model codex CLI launches (e.g. `gpt-5.4`). The runner's OWN model is Sonnet, set via Agent tool's `model: "sonnet"`. Do NOT conflate.
 - **Resume is the primary path for rounds 2-5.** Fresh-exec fallback consumes one round from the 5-round counter.
 - **Step 9 cleanup `rm` glob is UNCHANGED from pre-refactor.** It still covers `/tmp/codex-plan-${REVIEW_ID}.md`, `/tmp/codex-prompt-${REVIEW_ID}.md`, `/tmp/codex-resume-prompt-${REVIEW_ID}.md`, `/tmp/codex-review-${REVIEW_ID}.md`, `/tmp/codex-stdout-${REVIEW_ID}.jsonl`, `/tmp/codex-stderr-${REVIEW_ID}.txt`, `/tmp/codex-stdout-${REVIEW_ID}-failed-resume.jsonl`, `/tmp/codex-stderr-${REVIEW_ID}-failed-resume.txt`. ADD the two new paths introduced by the refactor: `/tmp/codex-body-${REVIEW_ID}.md` and `/tmp/codex-runner-result-${REVIEW_ID}.json`.
 - Cleanup is **conditional on terminal state**: remove temp files on approved/max-reached/not-verified; LEAVE them on abort (diagnostic value). Skip all cleanup in Plan Mode.
